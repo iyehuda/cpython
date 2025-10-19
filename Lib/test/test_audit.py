@@ -148,6 +148,8 @@ class AuditTest(unittest.TestCase):
             ["gc.get_objects", "gc.get_referrers", "gc.get_referents"]
         )
 
+    def test_builtins_setattr(self):
+        self.do_test("test_builtins_setattr")
 
     @support.requires_resource('network')
     def test_http(self):
@@ -330,6 +332,14 @@ class AuditTest(unittest.TestCase):
         self.assertTrue(any(["cpython.remote_debugger_script" in event for event in events]))
         if returncode:
             self.fail(stderr)
+
+    def test_atexit_register(self):
+        import_helper.import_module("atexit")
+        self.do_test("test_atexit_register")
+
+    def test_signal_signal(self):
+        import_helper.import_module("signal")
+        self.do_test("test_signal_signal")
 
 if __name__ == "__main__":
     unittest.main()

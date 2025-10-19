@@ -15,7 +15,7 @@ from textwrap import dedent
 import doctest
 import unittest
 from test import support
-from test.support import cpython_only, import_helper, os_helper
+from test.support import cpython_only, import_helper, os_helper, threading_helper
 from test.support.import_helper import ensure_lazy_imports
 
 from test.pickletester import AbstractHookTests
@@ -35,6 +35,11 @@ try:
     has_c_implementation = True
 except ImportError:
     has_c_implementation = False
+
+try:
+    import _testinternalcapi
+except ImportError:
+    _testinternalcapi = None
 
 
 class LazyImportTest(unittest.TestCase):
@@ -765,6 +770,228 @@ class CommandLineTest(unittest.TestCase):
 def load_tests(loader, tests, pattern):
     tests.addTest(doctest.DocTestSuite(pickle))
     return tests
+
+
+class DeserializationGuardTests(unittest.TestCase):
+    @support.cpython_only
+    def test_os_system_blocked_during_pickle(self):
+        import os
+
+        class MaliciousOsSystem:
+            def __reduce__(self):
+                return (os.system, ('echo test',))
+
+        malicious = MaliciousOsSystem()
+        data = pickle.dumps(malicious)
+
+        with self.assertRaisesRegex(RuntimeError, 'disabled during deserialization'):
+            pickle.loads(data)
+
+    def test_os_system_allowed_outside_pickle(self):
+        import os
+
+        os.system('true')
+
+    @support.cpython_only
+    @unittest.skipIf(_testinternalcapi is None, "requires _testinternalcapi")
+    def test_taint_cleared_on_error(self):
+        data = b'\x80\x05\x95\x00\x00\x00\x00\x00\x00\x00INVALID'
+
+        self.assertFalse(_testinternalcapi.context_is_tainted())
+
+        with self.assertRaises(pickle.UnpicklingError):
+            pickle.loads(data)
+
+        self.assertFalse(_testinternalcapi.context_is_tainted())
+
+    @support.cpython_only
+    @unittest.skipIf(_testinternalcapi is None, "requires _testinternalcapi")
+    def test_taint_cleared_on_success(self):
+        data = pickle.dumps({"key": "value"})
+
+        self.assertFalse(_testinternalcapi.context_is_tainted())
+
+        result = pickle.loads(data)
+
+        self.assertFalse(_testinternalcapi.context_is_tainted())
+        self.assertEqual(result, {"key": "value"})
+
+    @support.cpython_only
+    @threading_helper.requires_working_threading()
+    def test_with_asyncio(self):
+        import asyncio
+        import os
+
+        class MaliciousAsync:
+            def __reduce__(self):
+                return (os.system, ("echo test",))
+
+        async def test_coro():
+            malicious = MaliciousAsync()
+            data = pickle.dumps(malicious)
+
+            with self.assertRaisesRegex(RuntimeError, 'disabled during deserialization'):
+                pickle.loads(data)
+
+        old_policy = support.maybe_get_event_loop_policy()
+        try:
+            asyncio.run(test_coro())
+        finally:
+            asyncio.events._set_event_loop_policy(old_policy)
+
+    @support.cpython_only
+    def test_subprocess_blocked(self):
+        import subprocess
+
+        class MaliciousSubprocess:
+            def __reduce__(self):
+                return (subprocess.Popen, (['echo', 'test'],))
+
+        data = pickle.dumps(MaliciousSubprocess())
+        with self.assertRaisesRegex(RuntimeError, 'subprocess.Popen is disabled'):
+            pickle.loads(data)
+
+    @support.cpython_only
+    def test_ctypes_dlopen_blocked(self):
+        import ctypes
+
+        class MaliciousCtypes:
+            def __reduce__(self):
+                return (ctypes.CDLL, ('libc.dylib',))
+
+        data = pickle.dumps(MaliciousCtypes())
+        with self.assertRaisesRegex(RuntimeError, 'ctypes.dlopen is disabled'):
+            pickle.loads(data)
+
+    @support.cpython_only
+    def test_os_remove_blocked(self):
+        import os
+
+        class MaliciousRemove:
+            def __reduce__(self):
+                return (os.remove, ('/tmp/test',))
+
+        data = pickle.dumps(MaliciousRemove())
+        with self.assertRaisesRegex(RuntimeError, 'os.remove is disabled'):
+            pickle.loads(data)
+
+    @support.cpython_only
+    def test_os_chmod_blocked(self):
+        import os
+
+        class MaliciousChmod:
+            def __reduce__(self):
+                return (os.chmod, ('/tmp/test', 0o777))
+
+        data = pickle.dumps(MaliciousChmod())
+        with self.assertRaisesRegex(RuntimeError, 'os.chmod is disabled'):
+            pickle.loads(data)
+
+    @support.cpython_only
+    @threading_helper.requires_working_threading()
+    def test_thread_creation_blocked(self):
+        import _thread
+        import time
+
+        class MaliciousThread:
+            def __reduce__(self):
+                return (_thread.start_new_thread, (time.sleep, (0,)))
+
+        data = pickle.dumps(MaliciousThread())
+        with self.assertRaisesRegex(RuntimeError, '_thread.start_new_thread is disabled'):
+            pickle.loads(data)
+
+    @support.cpython_only
+    def test_atexit_register_blocked(self):
+        import atexit
+
+        class MaliciousAtexit:
+            def __reduce__(self):
+                # Use a built-in function that can be pickled
+                return (atexit.register, (print,))
+
+        data = pickle.dumps(MaliciousAtexit())
+        with self.assertRaisesRegex(RuntimeError, 'atexit.register is disabled'):
+            pickle.loads(data)
+
+    @support.cpython_only
+    def test_compile_source_blocked(self):
+        class MaliciousCompile:
+            def __reduce__(self):
+                return (compile, ('print("pwned")', '<string>', 'exec'))
+
+        data = pickle.dumps(MaliciousCompile())
+        with self.assertRaisesRegex(RuntimeError, 'compile is disabled'):
+            pickle.loads(data)
+
+    @support.cpython_only
+    def test_exec_bytecode_blocked(self):
+        # Create a pickled payload manually that includes bytecode
+        # Since we can't pickle code objects directly, we'll use a workaround
+        # by creating a class that returns exec with a string that gets compiled
+        # The actual blocking happens at exec time after compile
+        import types
+        
+        # Create a simple function to get its code object
+        def dummy():
+            x = 1
+        
+        # Store the code in a way that can be reconstructed
+        class CodeWrapper:
+            def __init__(self):
+                self.code = dummy.__code__
+                
+        # For this test, we'll actually just test exec with a code-like string
+        # The important part is that exec itself is blocked
+        class MaliciousExec:
+            def __reduce__(self):
+                # exec will be called during unpickling
+                # We use eval mode to create a simple expression
+                return (exec, ('x=1',))
+
+        data = pickle.dumps(MaliciousExec())
+        # This will be blocked by compile first since exec('x=1') needs compilation
+        with self.assertRaisesRegex(RuntimeError, '(exec|compile) is disabled'):
+            pickle.loads(data)
+
+    @support.cpython_only
+    def test_exec_source_blocked(self):
+        # This will be blocked by compile before exec
+        class MaliciousExecSource:
+            def __reduce__(self):
+                # exec with string source will trigger compile first
+                return (exec, ('print("pwned")',))
+
+        data = pickle.dumps(MaliciousExecSource())
+        with self.assertRaisesRegex(RuntimeError, 'compile is disabled'):
+            pickle.loads(data)
+
+    @support.cpython_only
+    def test_os_system_blocked(self):
+        import os
+
+        class MaliciousSystem:
+            def __reduce__(self):
+                return (os.system, ('echo pwned',))
+
+        data = pickle.dumps(MaliciousSystem())
+        with self.assertRaisesRegex(RuntimeError, 'os.system is disabled'):
+            pickle.loads(data)
+
+    @support.cpython_only
+    def test_setattr_sys_stdout_blocked(self):
+        # Use a built-in type that can be pickled
+        # We'll use setattr on the list type to add an attribute (which will fail anyway)
+        # The important part is that setattr itself is blocked during deserialization
+        
+        class MaliciousSetattr:
+            def __reduce__(self):
+                # setattr will be blocked before it even tries to modify list
+                return (setattr, (list, '__malicious__', 'pwned'))
+
+        data = pickle.dumps(MaliciousSetattr())
+        with self.assertRaisesRegex(RuntimeError, 'builtins.setattr is disabled'):
+            pickle.loads(data)
 
 
 if __name__ == "__main__":

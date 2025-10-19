@@ -4,11 +4,14 @@ import concurrent.futures
 import contextvars
 import functools
 import gc
+import os
 import random
+import tempfile
 import time
 import unittest
 import weakref
 from test import support
+from test.support import os_helper
 from test.support import threading_helper
 
 try:
@@ -1294,6 +1297,222 @@ class HamtTest(unittest.TestCase):
         with self.assertRaises(HashingError):
             with HaskKeyCrasher(error_on_hash=True):
                 h[AA]
+
+
+class DeserializationGuardTest(unittest.TestCase):
+    @support.cpython_only
+    def test_deserialization_taint_basic(self):
+        import _testinternalcapi
+
+        ctx = contextvars.copy_context()
+        self.assertFalse(_testinternalcapi.context_is_tainted())
+
+        with _testinternalcapi.deserialization_taint():
+            self.assertTrue(_testinternalcapi.context_is_tainted())
+
+        self.assertFalse(_testinternalcapi.context_is_tainted())
+
+    @support.cpython_only
+    def test_deserialization_taint_inheritance_copy(self):
+        import _testinternalcapi
+
+        with _testinternalcapi.deserialization_taint():
+            self.assertTrue(_testinternalcapi.context_is_tainted())
+
+            ctx = contextvars.copy_context()
+
+            def check_taint():
+                self.assertTrue(_testinternalcapi.context_is_tainted())
+
+            ctx.run(check_taint)
+
+    @support.cpython_only
+    def test_deserialization_taint_inheritance_new(self):
+        import _testinternalcapi
+
+        with _testinternalcapi.deserialization_taint():
+            self.assertTrue(_testinternalcapi.context_is_tainted())
+
+            ctx = contextvars.Context()
+
+            def check_taint():
+                self.assertTrue(_testinternalcapi.context_is_tainted())
+
+            ctx.run(check_taint)
+
+    @support.cpython_only
+    def test_deserialization_taint_nested(self):
+        import _testinternalcapi
+
+        self.assertFalse(_testinternalcapi.context_is_tainted())
+
+        with _testinternalcapi.deserialization_taint():
+            self.assertTrue(_testinternalcapi.context_is_tainted())
+
+            with _testinternalcapi.deserialization_taint():
+                self.assertTrue(_testinternalcapi.context_is_tainted())
+
+            self.assertTrue(_testinternalcapi.context_is_tainted())
+
+        self.assertFalse(_testinternalcapi.context_is_tainted())
+
+    @support.cpython_only
+    @unittest.skipUnless(hasattr(os, 'open'), 'requires os.open')
+    def test_os_open_blocked_during_deserialization(self):
+        import _testinternalcapi
+
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            testfn = f.name
+
+        try:
+            self.assertFalse(_testinternalcapi.context_is_tainted())
+
+            if hasattr(os, 'O_RDONLY'):
+                fd = os.open(testfn, os.O_RDONLY)
+                os.close(fd)
+
+            with _testinternalcapi.deserialization_taint():
+                if hasattr(os, 'O_RDONLY'):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        r'open is disabled during deserialization'
+                    ):
+                        os.open(testfn, os.O_RDONLY)
+
+                if hasattr(os, 'O_WRONLY'):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        r'open is disabled during deserialization'
+                    ):
+                        os.open(testfn, os.O_WRONLY | os.O_CREAT)
+
+                if hasattr(os, 'O_RDWR'):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        r'open is disabled during deserialization'
+                    ):
+                        os.open(testfn, os.O_RDWR)
+
+                if hasattr(os, 'O_CREAT'):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        r'open is disabled during deserialization'
+                    ):
+                        os.open(testfn, os.O_RDONLY | os.O_CREAT)
+
+                if hasattr(os, 'O_APPEND'):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        r'open is disabled during deserialization'
+                    ):
+                        os.open(testfn, os.O_RDONLY | os.O_APPEND)
+
+            self.assertFalse(_testinternalcapi.context_is_tainted())
+        finally:
+            os_helper.unlink(testfn)
+
+    @support.cpython_only
+    def test_compile_blocked_during_deserialization(self):
+        import _testinternalcapi
+
+        self.assertFalse(_testinternalcapi.context_is_tainted())
+
+        # compile should work normally
+        compile("1 + 1", "<string>", "eval")
+
+        with _testinternalcapi.deserialization_taint():
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r'compile is disabled during deserialization'
+            ):
+                compile("1 + 1", "<string>", "eval")
+
+        self.assertFalse(_testinternalcapi.context_is_tainted())
+
+    @support.cpython_only
+    def test_exec_blocked_during_deserialization(self):
+        import _testinternalcapi
+
+        self.assertFalse(_testinternalcapi.context_is_tainted())
+
+        # exec should work normally
+        code = compile("x = 1", "<string>", "exec")
+        exec(code)
+
+        with _testinternalcapi.deserialization_taint():
+            # Pre-compiled code object triggers exec audit event
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r'exec is disabled during deserialization'
+            ):
+                exec(code)
+
+        self.assertFalse(_testinternalcapi.context_is_tainted())
+
+    @support.cpython_only
+    def test_setattr_blocked_during_deserialization(self):
+        import _testinternalcapi
+
+        class TestClass:
+            pass
+
+        obj = TestClass()
+
+        self.assertFalse(_testinternalcapi.context_is_tainted())
+
+        # setattr should work normally
+        setattr(obj, "attr", "value")
+        self.assertEqual(obj.attr, "value")
+
+        with _testinternalcapi.deserialization_taint():
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r'builtins\.setattr is disabled during deserialization'
+            ):
+                setattr(obj, "attr2", "value2")
+
+        self.assertFalse(_testinternalcapi.context_is_tainted())
+
+    @support.cpython_only
+    def test_object_setattr_blocked_during_deserialization(self):
+        import _testinternalcapi
+
+        class TestClass:
+            pass
+
+        self.assertFalse(_testinternalcapi.context_is_tainted())
+
+        # Modifying class attributes should work normally
+        TestClass.__name__ = "ModifiedClass"
+
+        with _testinternalcapi.deserialization_taint():
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r'object\.__setattr__ is disabled during deserialization'
+            ):
+                TestClass.__name__ = "AnotherName"
+
+        self.assertFalse(_testinternalcapi.context_is_tainted())
+
+    @support.cpython_only
+    def test_custom_audit_event_blocked_during_deserialization(self):
+        import _testinternalcapi
+        import sys
+
+        self.assertFalse(_testinternalcapi.context_is_tainted())
+
+        # Custom audit event should work normally
+        sys.audit("custom.test.event", "arg1", "arg2")
+
+        with _testinternalcapi.deserialization_taint():
+            # Custom audit event should be blocked during deserialization
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r'custom\.test\.event is disabled during deserialization'
+            ):
+                sys.audit("custom.test.event", "arg1", "arg2")
+
+        self.assertFalse(_testinternalcapi.context_is_tainted())
 
 
 if __name__ == "__main__":

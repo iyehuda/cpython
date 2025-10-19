@@ -183,6 +183,10 @@ atexit_register(PyObject *module, PyObject *args, PyObject *kwargs)
                 "the first argument must be callable");
         return NULL;
     }
+
+    if (PySys_Audit("atexit.register", "O", func) < 0) {
+        return NULL;
+    }
     PyObject *func_args = PyTuple_GetSlice(args, 1, PyTuple_GET_SIZE(args));
     PyObject *func_kwargs = kwargs;
 
