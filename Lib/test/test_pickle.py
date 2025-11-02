@@ -995,6 +995,20 @@ class DeserializationGuardTests(unittest.TestCase):
             pickle.loads(data)
 
     @support.cpython_only
+    @threading_helper.requires_working_threading()
+    def test_threading_register_atexit_blocked_during_deserialization(self):
+        import threading
+
+        class MaliciousRegisterAtexit:
+            def __reduce__(self):
+                return (threading._register_atexit, (print,))
+
+        malicious = MaliciousRegisterAtexit()
+        data = pickle.dumps(malicious)
+        with self.assertRaisesRegex(RuntimeError, 'threading._register_atexit is disabled during deserialization'):
+            pickle.loads(data)
+
+    @support.cpython_only
     def test_exec_bytecode_blocked(self):
         # Create a pickled payload manually that includes bytecode
         # Since we can't pickle code objects directly, we'll use a workaround

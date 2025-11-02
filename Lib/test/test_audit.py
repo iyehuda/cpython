@@ -7,6 +7,7 @@ import unittest
 from test import support
 from test.support import import_helper
 from test.support import os_helper
+from test.support import threading_helper
 
 
 if not hasattr(sys, "addaudithook") or not hasattr(sys, "audit"):
@@ -336,6 +337,11 @@ class AuditTest(unittest.TestCase):
     def test_atexit_register(self):
         import_helper.import_module("atexit")
         self.do_test("test_atexit_register")
+
+    @threading_helper.requires_working_threading()
+    def test_threading_register_atexit(self):
+        import_helper.import_module("threading")
+        self.do_test("test_threading_register_atexit")
 
     def test_signal_signal(self):
         import_helper.import_module("signal")

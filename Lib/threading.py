@@ -58,6 +58,12 @@ try:
 except AttributeError:
     _CRLock = None
 TIMEOUT_MAX = _thread.TIMEOUT_MAX
+try:
+    _thread_register_atexit = _thread._register_atexit
+    _thread_call_atexits = _thread._call_atexits
+except AttributeError:
+    _thread_register_atexit = None
+    _thread_call_atexits = None
 del _thread
 
 # get thread-local implementation, either from the thread
@@ -1528,9 +1534,6 @@ def enumerate():
         return list(_active.values()) + list(_limbo.values())
 
 
-_threading_atexits = []
-_SHUTTING_DOWN = False
-
 def _register_atexit(func, *arg, **kwargs):
     """CPython internal: register *func* to be called before joining threads.
 
@@ -1541,10 +1544,15 @@ def _register_atexit(func, *arg, **kwargs):
 
     For similarity to atexit, the registered functions are called in reverse.
     """
-    if _SHUTTING_DOWN:
-        raise RuntimeError("can't register atexit after shutdown")
-
-    _threading_atexits.append(lambda: func(*arg, **kwargs))
+    # Create a closure that captures func, arg, and kwargs explicitly
+    # to ensure they survive module shutdown. Using a nested function
+    # instead of lambda with default args for better closure behavior.
+    def wrapper(func=func, arg=arg, kwargs=kwargs):
+        # Check if func is None before calling to avoid TypeError during shutdown
+        if func is None:
+            return None
+        return func(*arg, **kwargs)
+    _thread_register_atexit(wrapper)
 
 
 from _thread import stack_size
@@ -1567,13 +1575,9 @@ def _shutdown():
         # _shutdown() was already called
         return
 
-    global _SHUTTING_DOWN
-    _SHUTTING_DOWN = True
-
     # Call registered threading atexit functions before threads are joined.
     # Order is reversed, similar to atexit.
-    for atexit_call in reversed(_threading_atexits):
-        atexit_call()
+    _thread_call_atexits()
 
     if _is_main_interpreter():
         _main_thread._os_thread_handle._set_done()
