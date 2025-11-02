@@ -1557,6 +1557,7 @@ class CZoneInfoCacheTest(ZoneInfoCacheTest):
 
 class ZoneInfoPickleTest(TzPathUserMixin, ZoneInfoTestBase):
     module = py_zoneinfo
+    safe_pickle = False
 
     def setUp(self):
         self.klass.clear_cache()
@@ -1580,12 +1581,12 @@ class ZoneInfoPickleTest(TzPathUserMixin, ZoneInfoTestBase):
             with self.subTest(proto=proto):
                 zi_in = self.klass("Europe/Dublin")
                 pkl = pickle.dumps(zi_in, protocol=proto)
-                zi_rt = pickle.loads(pkl)
+                zi_rt = pickle.loads(pkl, safe=self.safe_pickle)
 
                 with self.subTest(test="Is non-pickled ZoneInfo"):
                     self.assertIs(zi_in, zi_rt)
 
-                zi_rt2 = pickle.loads(pkl)
+                zi_rt2 = pickle.loads(pkl, safe=self.safe_pickle)
                 with self.subTest(test="Is unpickled ZoneInfo"):
                     self.assertIs(zi_rt, zi_rt2)
 
@@ -1597,8 +1598,8 @@ class ZoneInfoPickleTest(TzPathUserMixin, ZoneInfoTestBase):
 
                 del zi_in
                 self.klass.clear_cache()  # Induce a cache miss
-                zi_rt = pickle.loads(pkl)
-                zi_rt2 = pickle.loads(pkl)
+                zi_rt = pickle.loads(pkl, safe=self.safe_pickle)
+                zi_rt2 = pickle.loads(pkl, safe=self.safe_pickle)
 
                 self.assertIs(zi_rt, zi_rt2)
 
@@ -1608,12 +1609,12 @@ class ZoneInfoPickleTest(TzPathUserMixin, ZoneInfoTestBase):
                 zi_no_cache = self.klass.no_cache("Europe/Dublin")
 
                 pkl = pickle.dumps(zi_no_cache, protocol=proto)
-                zi_rt = pickle.loads(pkl)
+                zi_rt = pickle.loads(pkl, safe=self.safe_pickle)
 
                 with self.subTest(test="Not the pickled object"):
                     self.assertIsNot(zi_rt, zi_no_cache)
 
-                zi_rt2 = pickle.loads(pkl)
+                zi_rt2 = pickle.loads(pkl, safe=self.safe_pickle)
                 with self.subTest(test="Not a second unpickled object"):
                     self.assertIsNot(zi_rt, zi_rt2)
 
@@ -1651,26 +1652,27 @@ class ZoneInfoPickleTest(TzPathUserMixin, ZoneInfoTestBase):
                 zi = self.klass(key)
 
                 pkl_0 = pickle.dumps(zi, protocol=proto)
-                zi_rt_0 = pickle.loads(pkl_0)
+                zi_rt_0 = pickle.loads(pkl_0, safe=self.safe_pickle)
                 self.assertIs(zi, zi_rt_0)
 
                 with open(self.zoneinfo_data.path_from_key(key), "rb") as f:
                     zi_ff = self.klass.from_file(f, key=key)
 
                 pkl_1 = pickle.dumps(zi, protocol=proto)
-                zi_rt_1 = pickle.loads(pkl_1)
+                zi_rt_1 = pickle.loads(pkl_1, safe=self.safe_pickle)
                 self.assertIs(zi, zi_rt_1)
 
                 with self.assertRaises(pickle.PicklingError):
                     pickle.dumps(zi_ff, protocol=proto)
 
                 pkl_2 = pickle.dumps(zi, protocol=proto)
-                zi_rt_2 = pickle.loads(pkl_2)
+                zi_rt_2 = pickle.loads(pkl_2, safe=self.safe_pickle)
                 self.assertIs(zi, zi_rt_2)
 
 
 class CZoneInfoPickleTest(ZoneInfoPickleTest):
     module = c_zoneinfo
+    safe_pickle = True
 
 
 class CallingConventionTest(ZoneInfoTestBase):

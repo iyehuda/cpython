@@ -7,6 +7,7 @@
 #include "pycore_initconfig.h"    // _PyStatus_OK()
 #include "pycore_object.h"
 #include "pycore_pyerrors.h"
+#include "pycore_pylifecycle.h"   // _Py_IsInterpreterFinalizing()
 #include "pycore_pystate.h"       // _PyThreadState_GET()
 
 #include <string.h>               // strcmp()
@@ -611,6 +612,9 @@ context_get(void)
     assert(ts != NULL);
     PyContext *current_ctx = (PyContext *)ts->context;
     if (current_ctx == NULL) {
+        if (_Py_IsInterpreterFinalizing(ts->interp)) {
+            return NULL;
+        }
         current_ctx = context_new_empty();
         if (current_ctx == NULL) {
             return NULL;

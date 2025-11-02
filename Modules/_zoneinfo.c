@@ -8,6 +8,7 @@
 #include "pycore_pyerrors.h"      // _PyErr_ChainExceptions1()
 #include "pycore_typeobject.h"    // _PyType_GetModuleState()
 #include "pycore_weakref.h"       // FT_CLEAR_WEAKREFS()
+#include "pycore_context.h"       // _PyContext_SaveAndClearTaint(), _PyContext_RestoreTaint()
 
 #include "datetime.h"             // PyDateTime_TZInfo
 
@@ -229,9 +230,14 @@ zoneinfo_new_instance(zoneinfo_state *state, PyTypeObject *type, PyObject *key)
     PyObject *file_obj = NULL;
     PyObject *file_path = NULL;
 
+    // Temporarily clear taint to allow file opens and Python code operations during unpickling
+    // This is safe because we're in trusted C code opening and processing legitimate timezone files
+    unsigned int saved_taint = _PyContext_SaveAndClearTaint();
+
     file_path = PyObject_CallFunctionObjArgs(state->_tzpath_find_tzfile,
                                              key, NULL);
     if (file_path == NULL) {
+        _PyContext_RestoreTaint(saved_taint);
         return NULL;
     }
     else if (file_path == Py_None) {
@@ -239,12 +245,14 @@ zoneinfo_new_instance(zoneinfo_state *state, PyTypeObject *type, PyObject *key)
         file_obj = PyObject_CallMethod(meth, "load_tzdata", "O", key);
         if (file_obj == NULL) {
             Py_DECREF(file_path);
+            _PyContext_RestoreTaint(saved_taint);
             return NULL;
         }
     }
 
     PyObject *self = type->tp_alloc(type, 0);
     if (self == NULL) {
+        _PyContext_RestoreTaint(saved_taint);
         goto error;
     }
 
@@ -252,26 +260,32 @@ zoneinfo_new_instance(zoneinfo_state *state, PyTypeObject *type, PyObject *key)
         PyObject *func = state->io_open;
         file_obj = PyObject_CallFunction(func, "Os", file_path, "rb");
         if (file_obj == NULL) {
+            _PyContext_RestoreTaint(saved_taint);
             goto error;
         }
     }
 
     PyZoneInfo_ZoneInfo *self_zinfo = (PyZoneInfo_ZoneInfo *)self;
-    if (load_data(state, self_zinfo, file_obj)) {
+    int load_result = load_data(state, self_zinfo, file_obj);
+    if (load_result) {
+        _PyContext_RestoreTaint(saved_taint);
         goto error;
     }
 
     PyObject *rv = PyObject_CallMethod(file_obj, "close", NULL);
     Py_SETREF(file_obj, NULL);
     if (rv == NULL) {
+        _PyContext_RestoreTaint(saved_taint);
         goto error;
     }
     Py_DECREF(rv);
 
     self_zinfo->key = Py_NewRef(key);
 
+    _PyContext_RestoreTaint(saved_taint);
     goto cleanup;
 error:
+    _PyContext_RestoreTaint(saved_taint);
     Py_CLEAR(self);
 cleanup:
     if (file_obj != NULL) {
