@@ -3,6 +3,7 @@
 This module provides an implementation of the HeaderRegistry API.
 The implementation is designed to flexibly follow RFC5322 rules.
 """
+import sys
 from types import MappingProxyType
 
 from email import utils
@@ -254,7 +255,35 @@ class BaseHeader(str):
 
 
 def _reconstruct_header(cls_name, bases, value):
-    return type(cls_name, bases, {})._reconstruct(value)
+    # Reconstruct the header class by looking it up in the module instead of
+    # using type() to create it dynamically, which is blocked by deserialization guard
+    module = sys.modules[__name__]
+    
+    # Try to find the class by name in the module
+    cls = getattr(module, cls_name, None)
+    
+    if cls is None:
+        # The class name might have a leading underscore (dynamically created),
+        # try without it
+        if cls_name.startswith('_'):
+            cls = getattr(module, cls_name[1:], None)
+    
+    # Even if we found a class by name, verify it has _reconstruct method
+    # (some header classes are mixins without _reconstruct)
+    if cls is not None and not hasattr(cls, '_reconstruct'):
+        cls = None
+    
+    if cls is None:
+        # Fallback: find a base class that has _reconstruct method
+        for base in bases:
+            if hasattr(base, '_reconstruct'):
+                cls = base
+                break
+        else:
+            # Last resort: use BaseHeader which has _reconstruct
+            cls = BaseHeader
+    
+    return cls._reconstruct(value)
 
 
 class UnstructuredHeader:

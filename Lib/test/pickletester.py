@@ -2460,6 +2460,7 @@ class AbstractPickleTests:
     # Subclass must define self.dumps, self.loads.
 
     optimized = False
+    safe = True  # Whether deserialization guard is enabled (C implementation)
 
     _testdata = AbstractUnpickleTests._testdata
 
@@ -2993,11 +2994,18 @@ class AbstractPickleTests:
     def test_dynamic_class(self):
         a = create_dynamic_class("my_dynamic_class", (object,))
         copyreg.pickle(pickling_metaclass, pickling_metaclass.__reduce__)
+        
         for proto in protocols:
             s = self.dumps(a, proto)
-            b = self.loads(s)
-            self.assertEqual(a, b)
-            self.assertIs(type(a), type(b))
+            if self.safe:
+                # With deserialization guard, type.__new__ is blocked
+                with self.assertRaisesRegex(RuntimeError, "type.__new__ is disabled"):
+                    self.loads(s)
+            else:
+                # Pure Python implementation without guard: should work
+                b = self.loads(s)
+                self.assertEqual(a, b)
+                self.assertIs(type(a), type(b))
 
     def test_structseq(self):
         import time

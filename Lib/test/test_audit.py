@@ -347,5 +347,26 @@ class AuditTest(unittest.TestCase):
         import_helper.import_module("signal")
         self.do_test("test_signal_signal")
 
+    def test_type_new(self):
+        import sys
+        
+        events = []
+        def audit_hook(event, args):
+            if event == 'type.__new__':
+                events.append((event, args))
+        
+        sys.addaudithook(audit_hook)
+        
+        dynamic_type = type('AuditTestType', (), {'test_attr': 42})
+        self.assertEqual(dynamic_type.__name__, 'AuditTestType')
+        self.assertEqual(dynamic_type.test_attr, 42)
+        self.assertGreaterEqual(len(events), 1)
+        
+        # Find the event for our type
+        audit_test_events = [e for e in events if e[1] and e[1][0] == 'AuditTestType']
+        self.assertEqual(len(audit_test_events), 1)
+        self.assertEqual(audit_test_events[0][0], 'type.__new__')
+        self.assertEqual(audit_test_events[0][1][0], 'AuditTestType')
+
 if __name__ == "__main__":
     unittest.main()

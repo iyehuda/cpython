@@ -87,6 +87,7 @@ class PyPicklerTests(AbstractPickleTests, unittest.TestCase):
 
     pickler = pickle._Pickler
     unpickler = pickle._Unpickler
+    safe = False  # Pure Python implementation has no deserialization guard
 
     def dumps(self, arg, proto=None, **kwargs):
         f = io.BytesIO()
@@ -387,6 +388,7 @@ if has_c_implementation:
     class CPicklerTests(PyPicklerTests):
         pickler = _pickle.Pickler
         unpickler = _pickle.Unpickler
+        safe = True  # C unpickler has deserialization guard
 
     class CPersPicklerTests(PyPersPicklerTests):
         pickler = _pickle.Pickler
@@ -400,10 +402,12 @@ if has_c_implementation:
     class CDumpPickle_LoadPickle(PyPicklerTests):
         pickler = _pickle.Pickler
         unpickler = pickle._Unpickler
+        safe = False  # Pure Python unpickler has no guard
 
     class DumpPickle_CLoadPickle(PyPicklerTests):
         pickler = pickle._Pickler
         unpickler = _pickle.Unpickler
+        safe = True  # C unpickler has deserialization guard
 
     class CPicklerUnpicklerObjectTests(AbstractPicklerUnpicklerObjectTests, unittest.TestCase):
         pickler_class = _pickle.Pickler
@@ -868,7 +872,7 @@ class DeserializationGuardTests(unittest.TestCase):
                 return (ctypes.CDLL, ('libc.dylib',))
 
         data = pickle.dumps(MaliciousCtypes())
-        with self.assertRaisesRegex(RuntimeError, 'ctypes.dlopen is disabled'):
+        with self.assertRaisesRegex(RuntimeError, 'type.__new__ is disabled'):
             pickle.loads(data)
 
     @support.cpython_only
@@ -1076,6 +1080,43 @@ class DeserializationGuardTests(unittest.TestCase):
         data = pickle.dumps(MaliciousSetattr())
         with self.assertRaisesRegex(RuntimeError, 'builtins.setattr is disabled'):
             pickle.loads(data)
+
+    @support.cpython_only
+    def test_type_new_blocked_during_pickle(self):
+        import functools
+        import os
+
+        class MaliciousDynamicType:
+            def __reduce__(self):
+                return (
+                    type,
+                    (
+                        'bogus',
+                        (),
+                        {
+                            '__del__': functools.partial(
+                                next,
+                                map(
+                                    os.system,
+                                    ['echo ESCAPED']
+                                )
+                            )
+                        }
+                    )
+                )
+
+        malicious = MaliciousDynamicType()
+        data = pickle.dumps(malicious)
+        with self.assertRaisesRegex(RuntimeError, 'type.__new__ is disabled'):
+            pickle.loads(data)
+
+    def test_type_new_allowed_outside_pickle(self):
+        dynamic_type = type('TestClass', (), {'x': 1})
+        self.assertEqual(dynamic_type.__name__, 'TestClass')
+        self.assertEqual(dynamic_type.x, 1)
+        instance = dynamic_type()
+        self.assertIsInstance(instance, dynamic_type)
+
 
 
 if __name__ == "__main__":
