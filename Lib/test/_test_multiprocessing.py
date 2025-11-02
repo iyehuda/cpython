@@ -4476,8 +4476,8 @@ class _TestSharedMemory(BaseTestCase):
                 # Test pickling
                 pickled_sms = pickle.dumps(sms, protocol=proto)
 
-                # Test unpickling
-                sms2 = pickle.loads(pickled_sms)
+                # Test unpickling (use safe=False for multiprocessing)
+                sms2 = pickle.loads(pickled_sms, safe=False)
                 self.assertIsInstance(sms2, shared_memory.SharedMemory)
                 self.assertEqual(sms.name, sms2.name)
                 self.assertEqual(bytes(sms.buf[0:6]), b'pickle')
@@ -4505,7 +4505,7 @@ class _TestSharedMemory(BaseTestCase):
                 sms.unlink()
 
                 with self.assertRaises(FileNotFoundError):
-                    pickle.loads(pickled_sms)
+                    pickle.loads(pickled_sms, safe=False)
 
     def test_shared_memory_across_processes(self):
         # bpo-40135: don't define shared memory block's name in case of
@@ -4730,7 +4730,7 @@ class _TestSharedMemory(BaseTestCase):
                 self.addCleanup(sl.shm.unlink)
 
                 serialized_sl = pickle.dumps(sl, protocol=proto)
-                deserialized_sl = pickle.loads(serialized_sl)
+                deserialized_sl = pickle.loads(serialized_sl, safe=False)
                 self.assertIsInstance(
                     deserialized_sl, shared_memory.ShareableList)
                 self.assertEqual(deserialized_sl[-1], 9)
@@ -4762,7 +4762,7 @@ class _TestSharedMemory(BaseTestCase):
                 sl.shm.unlink()
 
                 with self.assertRaises(FileNotFoundError):
-                    pickle.loads(serialized_sl)
+                    pickle.loads(serialized_sl, safe=False)
 
     def test_shared_memory_cleaned_after_process_termination(self):
         cmd = '''if 1:

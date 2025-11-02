@@ -51,7 +51,10 @@ class ForkingPickler(pickle.Pickler):
         cls(buf, protocol).dump(obj)
         return buf.getbuffer()
 
-    loads = pickle.loads
+    @classmethod
+    def loads(cls, data, *, safe=False, **kwargs):
+        '''Load object from pickle data, allowing unsafe mode for multiprocessing.'''
+        return pickle.loads(data, safe=safe, **kwargs)
 
 register = ForkingPickler.register
 

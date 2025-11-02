@@ -528,6 +528,10 @@ signal_signal_impl(PyObject *module, int signalnum, PyObject *handler)
         return NULL;
     }
 
+    if (PySys_Audit("signal.signal", "iO", signalnum, handler) < 0) {
+        return NULL;
+    }
+
     /* Check for pending signals before changing signal handler */
     if (_PyErr_CheckSignalsTstate(tstate)) {
         return NULL;

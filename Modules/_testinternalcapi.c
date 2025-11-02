@@ -1552,6 +1552,108 @@ new_hamt(PyObject *self, PyObject *args)
 
 
 static PyObject*
+context_is_tainted(PyObject *self, PyObject *Py_UNUSED(args))
+{
+    int is_tainted = _PyContext_IsDeserializationTainted();
+    return PyBool_FromLong(is_tainted);
+}
+
+
+typedef struct {
+    PyObject_HEAD
+    int entered;
+} ContextTaintGuard;
+
+
+static void
+taint_guard_dealloc(PyObject *self)
+{
+    PyTypeObject *tp = Py_TYPE(self);
+    tp->tp_free(self);
+    Py_DECREF(tp);
+}
+
+
+static PyObject *
+taint_guard_enter(PyObject *op, PyObject *Py_UNUSED(args))
+{
+    ContextTaintGuard *self = (ContextTaintGuard *)op;
+    
+    if (_PyContext_IncrementDeserializationTaint() < 0) {
+        return NULL;
+    }
+    
+    self->entered = 1;
+    return Py_NewRef(self);
+}
+
+
+static PyObject *
+taint_guard_exit(PyObject *op, PyObject *Py_UNUSED(args))
+{
+    ContextTaintGuard *self = (ContextTaintGuard *)op;
+    
+    if (!self->entered) {
+        Py_RETURN_NONE;
+    }
+    
+    self->entered = 0;
+    
+    if (_PyContext_DecrementDeserializationTaint() < 0) {
+        return NULL;
+    }
+    
+    Py_RETURN_NONE;
+}
+
+
+static PyMethodDef taint_guard_methods[] = {
+    {"__enter__", taint_guard_enter, METH_NOARGS, NULL},
+    {"__exit__", taint_guard_exit, METH_VARARGS, NULL},
+    {NULL, NULL}
+};
+
+
+static PyType_Slot taint_guard_slots[] = {
+    {Py_tp_dealloc, taint_guard_dealloc},
+    {Py_tp_methods, taint_guard_methods},
+    {0, NULL},
+};
+
+
+static PyType_Spec taint_guard_spec = {
+    .name = "_testinternalcapi.DeserializationTaintGuard",
+    .basicsize = sizeof(ContextTaintGuard),
+    .flags = (Py_TPFLAGS_DEFAULT | Py_TPFLAGS_IMMUTABLETYPE | 
+              Py_TPFLAGS_DISALLOW_INSTANTIATION),
+    .slots = taint_guard_slots,
+};
+
+
+static PyObject *
+deserialization_taint(PyObject *module, PyObject *Py_UNUSED(args))
+{
+    static PyTypeObject *TaintGuard_Type = NULL;
+    
+    if (TaintGuard_Type == NULL) {
+        TaintGuard_Type = (PyTypeObject *)PyType_FromModuleAndSpec(
+            module, &taint_guard_spec, NULL);
+        if (TaintGuard_Type == NULL) {
+            return NULL;
+        }
+    }
+    
+    ContextTaintGuard *guard = PyObject_New(ContextTaintGuard, TaintGuard_Type);
+    if (guard == NULL) {
+        return NULL;
+    }
+    
+    guard->entered = 0;
+    return (PyObject *)guard;
+}
+
+
+static PyObject*
 dict_getitem_knownhash(PyObject *self, PyObject *args)
 {
     PyObject *mp, *key, *result;
@@ -2465,6 +2567,8 @@ static PyMethodDef module_functions[] = {
     {"pymem_getallocatorsname", test_pymem_getallocatorsname, METH_NOARGS},
     {"get_object_dict_values", get_object_dict_values, METH_O},
     {"hamt", new_hamt, METH_NOARGS},
+    {"context_is_tainted", context_is_tainted, METH_NOARGS},
+    {"deserialization_taint", deserialization_taint, METH_NOARGS},
     {"dict_getitem_knownhash",  dict_getitem_knownhash,          METH_VARARGS},
     {"create_interpreter", _PyCFunction_CAST(create_interpreter),
      METH_VARARGS | METH_KEYWORDS},

@@ -1722,6 +1722,9 @@ builtin_setattr_impl(PyObject *module, PyObject *obj, PyObject *name,
                      PyObject *value)
 /*[clinic end generated code: output=dc2ce1d1add9acb4 input=5e26417f2e8598d4]*/
 {
+    if (PySys_Audit("builtins.setattr", "OOO", obj, name, value) < 0) {
+        return NULL;
+    }
     if (PyObject_SetAttr(obj, name, value) != 0)
         return NULL;
     Py_RETURN_NONE;

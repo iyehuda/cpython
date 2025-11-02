@@ -1877,12 +1877,16 @@ def _dumps(obj, protocol=None, *, fix_imports=True, buffer_callback=None):
     return res
 
 def _load(file, *, fix_imports=True, encoding="ASCII", errors="strict",
-          buffers=None):
+          buffers=None, safe=True):
+    # Python fallback doesn't have guard protection, so safe parameter is ignored
+    # Always behaves as safe=False
     return _Unpickler(file, fix_imports=fix_imports, buffers=buffers,
                      encoding=encoding, errors=errors).load()
 
 def _loads(s, /, *, fix_imports=True, encoding="ASCII", errors="strict",
-           buffers=None):
+           buffers=None, safe=True):
+    # Python fallback doesn't have guard protection, so safe parameter is ignored
+    # Always behaves as safe=False
     if isinstance(s, str):
         raise TypeError("Can't load pickle from unicode string")
     file = io.BytesIO(s)

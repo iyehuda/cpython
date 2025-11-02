@@ -4709,6 +4709,10 @@ type_new(PyTypeObject *metatype, PyObject *args, PyObject *kwds)
         return NULL;
     }
 
+    if (PySys_Audit("type.__new__", "O", name) < 0) {
+        return NULL;
+    }
+
     type_new_ctx ctx = {
         .metatype = metatype,
         .args = args,

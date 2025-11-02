@@ -12,10 +12,11 @@ Copyright (c) Corporation for National Research Initiatives.
 #include "pycore_call.h"          // _PyObject_CallNoArgs()
 #include "pycore_interp.h"        // PyInterpreterState.codec_search_path
 #include "pycore_pyerrors.h"      // _PyErr_FormatNote()
-#include "pycore_pystate.h"       // _PyInterpreterState_GET()
+#include "pycore_pystate.h"       // _PyInterpreterState_GET(), _PyThreadState_GET()
 #include "pycore_runtime.h"       // _Py_ID()
 #include "pycore_ucnhash.h"       // _PyUnicode_Name_CAPI
 #include "pycore_unicodeobject.h" // _PyUnicode_InternMortal()
+#include "pycore_audit.h"         // _PySys_Audit()
 
 
 static const char *codecs_builtin_error_handlers[] = {
@@ -40,6 +41,11 @@ int PyCodec_Register(PyObject *search_function)
         PyErr_SetString(PyExc_TypeError, "argument must be callable");
         goto onError;
     }
+    
+    if (_PySys_Audit(_PyThreadState_GET(), "codecs.register", "O", search_function) < 0) {
+        goto onError;
+    }
+    
 #ifdef Py_GIL_DISABLED
     PyMutex_Lock(&interp->codecs.search_path_mutex);
 #endif
@@ -187,7 +193,13 @@ PyObject *_PyCodec_Lookup(const char *encoding)
         func = PyList_GetItemRef(interp->codecs.search_path, i);
         if (func == NULL)
             goto onError;
+        
+        // Clear taint around codec search function calls to allow imports
+        // (encodings.search_function needs to import encoding modules)
+        unsigned int saved_taint = _PyContext_SaveAndClearTaint();
         result = PyObject_CallOneArg(func, v);
+        _PyContext_RestoreTaint(saved_taint);
+        
         Py_DECREF(func);
         if (result == NULL)
             goto onError;
@@ -630,6 +642,11 @@ int PyCodec_RegisterError(const char *name, PyObject *error)
         PyErr_SetString(PyExc_TypeError, "handler must be callable");
         return -1;
     }
+    
+    if (_PySys_Audit(_PyThreadState_GET(), "codecs.register_error", "sO", name, error) < 0) {
+        return -1;
+    }
+    
     return PyDict_SetItemString(interp->codecs.error_registry,
                                 name, error);
 }

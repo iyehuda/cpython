@@ -7,6 +7,7 @@ import unittest
 from test import support
 from test.support import import_helper
 from test.support import os_helper
+from test.support import threading_helper
 
 
 if not hasattr(sys, "addaudithook") or not hasattr(sys, "audit"):
@@ -148,6 +149,8 @@ class AuditTest(unittest.TestCase):
             ["gc.get_objects", "gc.get_referrers", "gc.get_referents"]
         )
 
+    def test_builtins_setattr(self):
+        self.do_test("test_builtins_setattr")
 
     @support.requires_resource('network')
     def test_http(self):
@@ -330,6 +333,40 @@ class AuditTest(unittest.TestCase):
         self.assertTrue(any(["cpython.remote_debugger_script" in event for event in events]))
         if returncode:
             self.fail(stderr)
+
+    def test_atexit_register(self):
+        import_helper.import_module("atexit")
+        self.do_test("test_atexit_register")
+
+    @threading_helper.requires_working_threading()
+    def test_threading_register_atexit(self):
+        import_helper.import_module("threading")
+        self.do_test("test_threading_register_atexit")
+
+    def test_signal_signal(self):
+        import_helper.import_module("signal")
+        self.do_test("test_signal_signal")
+
+    def test_type_new(self):
+        import sys
+        
+        events = []
+        def audit_hook(event, args):
+            if event == 'type.__new__':
+                events.append((event, args))
+        
+        sys.addaudithook(audit_hook)
+        
+        dynamic_type = type('AuditTestType', (), {'test_attr': 42})
+        self.assertEqual(dynamic_type.__name__, 'AuditTestType')
+        self.assertEqual(dynamic_type.test_attr, 42)
+        self.assertGreaterEqual(len(events), 1)
+        
+        # Find the event for our type
+        audit_test_events = [e for e in events if e[1] and e[1][0] == 'AuditTestType']
+        self.assertEqual(len(audit_test_events), 1)
+        self.assertEqual(audit_test_events[0][0], 'type.__new__')
+        self.assertEqual(audit_test_events[0][1][0], 'AuditTestType')
 
 if __name__ == "__main__":
     unittest.main()

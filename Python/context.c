@@ -7,8 +7,24 @@
 #include "pycore_initconfig.h"    // _PyStatus_OK()
 #include "pycore_object.h"
 #include "pycore_pyerrors.h"
+#include "pycore_pylifecycle.h"   // _Py_IsInterpreterFinalizing()
 #include "pycore_pystate.h"       // _PyThreadState_GET()
 
+#include <string.h>               // strcmp()
+#include <ctype.h>                // tolower()
+
+#ifdef HAVE_FCNTL_H
+#  include <fcntl.h>              // O_WRONLY, O_RDWR, O_CREAT, O_APPEND
+#endif
+
+
+typedef enum {
+    HARDEN_MODE_OFF,
+    HARDEN_MODE_WARN,
+    HARDEN_MODE_ON
+} HardenMode;
+
+static HardenMode _harden_mode = HARDEN_MODE_ON;
 
 
 #include "clinic/context.c.h"
@@ -38,6 +54,25 @@ module _contextvars
                         "an instance of Token was expected");       \
         return err_ret;                                             \
     }
+
+#define DESERIALIZATION_ERROR_OR_WARN(event)                                \
+    do {                                                                    \
+        if (_harden_mode == HARDEN_MODE_WARN) {                             \
+            if (PyErr_WarnFormat(                                           \
+                    PyExc_RuntimeWarning, 1,                                \
+                    "Insecure %s during deserialization was detected",      \
+                    event) < 0)                                             \
+            {                                                               \
+                return -1;                                                  \
+            }                                                               \
+            return 0;                                                       \
+        }                                                                   \
+        else {                                                              \
+            PyErr_Format(PyExc_RuntimeError,                                \
+                         "%s is disabled during deserialization", event);   \
+            return -1;                                                      \
+        }                                                                   \
+    } while (0)
 
 
 /////////////////////////// Context API
@@ -257,6 +292,83 @@ PyContext_Exit(PyObject *octx)
 }
 
 
+int
+_PyContext_IncrementDeserializationTaint(void)
+{
+    PyContext *ctx = context_get();
+    if (ctx == NULL) {
+        return -1;
+    }
+
+    if (ctx->security_ctx.deserialization_taint_counter == UINT_MAX) {
+        PyErr_SetString(PyExc_RuntimeError,
+                        "deserialization taint counter overflow");
+        return -1;
+    }
+    ctx->security_ctx.deserialization_taint_counter++;
+
+    return 0;
+}
+
+
+int
+_PyContext_DecrementDeserializationTaint(void)
+{
+    PyContext *ctx = context_get();
+    if (ctx == NULL) {
+        return -1;
+    }
+
+    if (ctx->security_ctx.deserialization_taint_counter == 0) {
+        PyErr_SetString(PyExc_RuntimeError,
+                        "deserialization taint counter underflow");
+        return -1;
+    }
+
+    ctx->security_ctx.deserialization_taint_counter--;
+
+    return 0;
+}
+
+
+int
+_PyContext_IsDeserializationTainted(void)
+{
+    PyContext *ctx = context_get();
+    if (ctx == NULL) {
+        return 0;
+    }
+
+    return ctx->security_ctx.deserialization_taint_counter != 0;
+}
+
+
+unsigned int
+_PyContext_SaveAndClearTaint(void)
+{
+    PyContext *ctx = context_get();
+    if (ctx == NULL) {
+        return 0;
+    }
+
+    unsigned int saved = ctx->security_ctx.deserialization_taint_counter;
+    ctx->security_ctx.deserialization_taint_counter = 0;
+    return saved;
+}
+
+
+void
+_PyContext_RestoreTaint(unsigned int saved_value)
+{
+    PyContext *ctx = context_get();
+    if (ctx == NULL) {
+        return;
+    }
+
+    ctx->security_ctx.deserialization_taint_counter = saved_value;
+}
+
+
 PyObject *
 PyContextVar_New(const char *name, PyObject *def)
 {
@@ -422,6 +534,18 @@ class _contextvars.Context "PyContext *" "&PyContext_Type"
 #define _PyContext_CAST(op)     ((PyContext *)(op))
 
 
+static inline void
+_context_propagate_taint(PyContext *ctx)
+{
+    PyThreadState *ts = _PyThreadState_GET();
+    if (ts != NULL && ts->context != NULL) {
+        PyContext *current = (PyContext *)ts->context;
+        ctx->security_ctx.deserialization_taint_counter =
+            current->security_ctx.deserialization_taint_counter;
+    }
+}
+
+
 static inline PyContext *
 _context_alloc(void)
 {
@@ -437,6 +561,7 @@ _context_alloc(void)
     ctx->ctx_prev = NULL;
     ctx->ctx_entered = 0;
     ctx->ctx_weakreflist = NULL;
+    ctx->security_ctx.deserialization_taint_counter = 0;
 
     return ctx;
 }
@@ -456,6 +581,8 @@ context_new_empty(void)
         return NULL;
     }
 
+    _context_propagate_taint(ctx);
+
     _PyObject_GC_TRACK(ctx);
     return ctx;
 }
@@ -471,6 +598,8 @@ context_new_from_vars(PyHamtObject *vars)
 
     ctx->ctx_vars = (PyHamtObject*)Py_NewRef(vars);
 
+    _context_propagate_taint(ctx);
+
     _PyObject_GC_TRACK(ctx);
     return ctx;
 }
@@ -483,6 +612,9 @@ context_get(void)
     assert(ts != NULL);
     PyContext *current_ctx = (PyContext *)ts->context;
     if (current_ctx == NULL) {
+        if (_Py_IsInterpreterFinalizing(ts->interp)) {
+            return NULL;
+        }
         current_ctx = context_new_empty();
         if (current_ctx == NULL) {
             return NULL;
@@ -1354,6 +1486,53 @@ get_token_missing(void)
 ///////////////////////////
 
 
+static HardenMode
+_parse_harden_mode(void)
+{
+    const char *env_value = getenv("PYTHONHARDENMODE");
+    if (env_value == NULL) {
+        return HARDEN_MODE_ON;
+    }
+
+    char lower_value[16] = {0};
+    size_t i = 0;
+    while (env_value[i] != '\0' && i < sizeof(lower_value) - 1) {
+        lower_value[i] = tolower((unsigned char)env_value[i]);
+        i++;
+    }
+    lower_value[i] = '\0';
+
+    if (strcmp(lower_value, "off") == 0) {
+        return HARDEN_MODE_OFF;
+    }
+    else if (strcmp(lower_value, "warn") == 0) {
+        return HARDEN_MODE_WARN;
+    }
+    else {
+        return HARDEN_MODE_ON;
+    }
+}
+
+
+static int
+_deserialization_guard_audit_hook(const char *event, PyObject *args,
+                                   void *userData)
+{
+    if (!_PyContext_IsDeserializationTainted()) {
+        return 0;
+    }
+
+    if (strcmp(event, "pickle.find_class") == 0 ||
+        strcmp(event, "object.__getattr__") == 0 ||
+        strcmp(event, "array.__new__") == 0)
+    {
+        return 0;
+    }
+
+    DESERIALIZATION_ERROR_OR_WARN(event);
+}
+
+
 PyStatus
 _PyContext_Init(PyInterpreterState *interp)
 {
@@ -1366,6 +1545,14 @@ _PyContext_Init(PyInterpreterState *interp)
         return _PyStatus_ERR("can't init context types");
     }
     Py_DECREF(missing);
+
+    _harden_mode = _parse_harden_mode();
+
+    if (_harden_mode != HARDEN_MODE_OFF) {
+        if (PySys_AddAuditHook(_deserialization_guard_audit_hook, NULL) < 0) {
+            return _PyStatus_ERR("can't add deserialization guard audit hook");
+        }
+    }
 
     return _PyStatus_OK();
 }

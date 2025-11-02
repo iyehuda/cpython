@@ -13,6 +13,7 @@
 #include "pycore_sysmodule.h"     // _PySys_GetOptionalAttr()
 #include "pycore_time.h"          // _PyTime_FromSeconds()
 #include "pycore_weakref.h"       // _PyWeakref_GET_REF()
+#include "pycore_audit.h"         // _PySys_Audit()
 
 #include <stddef.h>               // offsetof()
 #ifdef HAVE_SIGNAL_H
@@ -38,6 +39,10 @@ typedef struct {
     // Linked list of handles to all non-daemon threads created by the
     // threading module. We wait for these to finish at shutdown.
     struct llist_node shutdown_handles;
+    
+    // Threading atexit callbacks storage (non-exported C variable)
+    PyObject *threading_atexits;
+    int threading_shutting_down;
 } thread_module_state;
 
 static inline thread_module_state*
@@ -46,6 +51,37 @@ get_thread_state(PyObject *module)
     void *state = _PyModule_GetState(module);
     assert(state != NULL);
     return (thread_module_state *)state;
+}
+
+static PyObject *
+_get_current_module(void)
+{
+    PyObject *name = PyUnicode_FromString("_thread");
+    if (name == NULL) {
+        return NULL;
+    }
+    PyObject *mod = PyImport_GetModule(name);
+    Py_DECREF(name);
+    if (mod == NULL) {
+        return NULL;
+    }
+    if (mod == Py_None) {
+        Py_DECREF(mod);
+        return NULL;
+    }
+    return mod;
+}
+
+static thread_module_state *
+_get_current_module_state(void)
+{
+    PyObject *mod = _get_current_module();
+    if (mod == NULL) {
+        return NULL;
+    }
+    thread_module_state *state = get_thread_state(mod);
+    Py_DECREF(mod);
+    return state;
 }
 
 
@@ -2596,6 +2632,136 @@ _thread_set_name_impl(PyObject *module, PyObject *name_obj)
 #endif  // HAVE_PTHREAD_SETNAME_NP || HAVE_PTHREAD_SET_NAME_NP || MS_WINDOWS
 
 
+// Threading atexit implementation
+
+// Initialize the atexits list (called during module initialization)
+static int
+threading_atexits_init(thread_module_state *state)
+{
+    if (state->threading_atexits == NULL) {
+        state->threading_atexits = PyList_New(0);
+        if (state->threading_atexits == NULL) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+// Cleanup the atexits list (called during module cleanup)
+static void
+threading_atexits_clear(thread_module_state *state)
+{
+    Py_CLEAR(state->threading_atexits);
+    state->threading_shutting_down = 0;
+}
+
+// Exported C function to register an atexit callback
+PyAPI_FUNC(int)
+_PyThread_RegisterAtexit(PyObject *callable)
+{
+    PyThreadState *tstate = _PyThreadState_GET();
+    
+    thread_module_state *state = _get_current_module_state();
+    if (state == NULL) {
+        if (!PyErr_Occurred()) {
+            PyErr_SetString(PyExc_RuntimeError,
+                            "_thread module not initialized");
+        }
+        return -1;
+    }
+    
+    if (state->threading_shutting_down) {
+        PyErr_SetString(PyExc_RuntimeError, 
+                        "can't register atexit after shutdown");
+        return -1;
+    }
+    
+    if (!PyCallable_Check(callable)) {
+        PyErr_SetString(PyExc_TypeError, "callable must be callable");
+        return -1;
+    }
+    
+    if (state->threading_atexits == NULL) {
+        if (threading_atexits_init(state) < 0) {
+            return -1;
+        }
+    }
+    
+    // Raise audit event
+    if (_PySys_Audit(tstate, "threading._register_atexit", "O", callable) < 0) {
+        return -1;
+    }
+    
+    Py_INCREF(callable);
+    if (PyList_Append(state->threading_atexits, callable) < 0) {
+        Py_DECREF(callable);
+        return -1;
+    }
+    
+    return 0;
+}
+
+// Exported C function to call all registered atexits
+PyAPI_FUNC(void)
+_PyThread_CallAtexits(void)
+{
+    thread_module_state *state = _get_current_module_state();
+    if (state == NULL) {
+        // Module not initialized or error getting state - nothing to do
+        PyErr_Clear();
+        return;
+    }
+    
+    if (state->threading_atexits == NULL) {
+        return;
+    }
+    
+    state->threading_shutting_down = 1;
+    
+    Py_ssize_t len = PyList_GET_SIZE(state->threading_atexits);
+    // Call in reverse order (similar to atexit)
+    for (Py_ssize_t i = len - 1; i >= 0; i--) {
+        PyObject *wrapper = PyList_GET_ITEM(state->threading_atexits, i);
+        // Hold a reference to the wrapper during the call to prevent
+        // it from being deallocated if the list is cleared during shutdown
+        Py_INCREF(wrapper);
+        PyObject *result = PyObject_CallNoArgs(wrapper);
+        if (result == NULL) {
+            PyErr_WriteUnraisable(wrapper);
+            PyErr_Clear();
+        }
+        else {
+            Py_DECREF(result);
+        }
+        Py_DECREF(wrapper);
+    }
+}
+
+// Python wrapper for _register_atexit
+static PyObject *
+thread_register_atexit(PyObject *module, PyObject *callable)
+{
+    if (!PyCallable_Check(callable)) {
+        PyErr_SetString(PyExc_TypeError, "argument must be callable");
+        return NULL;
+    }
+    
+    if (_PyThread_RegisterAtexit(callable) < 0) {
+        return NULL;
+    }
+    
+    Py_RETURN_NONE;
+}
+
+// Python wrapper for _call_atexits
+static PyObject *
+thread_call_atexits(PyObject *module, PyObject *Py_UNUSED(ignored))
+{
+    _PyThread_CallAtexits();
+    Py_RETURN_NONE;
+}
+
+
 static PyMethodDef thread_methods[] = {
     {"start_new_thread",        thread_PyThread_start_new_thread,
      METH_VARARGS, start_new_thread_doc},
@@ -2635,6 +2801,10 @@ static PyMethodDef thread_methods[] = {
      METH_O, thread__make_thread_handle_doc},
     {"_get_main_thread_ident", thread__get_main_thread_ident,
      METH_NOARGS, thread__get_main_thread_ident_doc},
+    {"_register_atexit", thread_register_atexit,
+     METH_O, "Register a callable to be called before joining threads."},
+    {"_call_atexits", thread_call_atexits,
+     METH_NOARGS, "Call all registered atexit functions."},
     _THREAD_SET_NAME_METHODDEF
     _THREAD__GET_NAME_METHODDEF
     {NULL,                      NULL}           /* sentinel */
@@ -2728,6 +2898,11 @@ thread_module_exec(PyObject *module)
 
     llist_init(&state->shutdown_handles);
 
+    // Initialize threading atexits
+    if (threading_atexits_init(state) < 0) {
+        return -1;
+    }
+
 #ifdef _PYTHREAD_NAME_MAXLEN
     if (PyModule_AddIntConstant(module, "_NAME_MAXLEN",
                                 _PYTHREAD_NAME_MAXLEN) < 0) {
@@ -2773,6 +2948,7 @@ thread_module_traverse(PyObject *module, visitproc visit, void *arg)
     Py_VISIT(state->local_type);
     Py_VISIT(state->local_dummy_type);
     Py_VISIT(state->thread_handle_type);
+    Py_VISIT(state->threading_atexits);
     return 0;
 }
 
@@ -2789,6 +2965,7 @@ thread_module_clear(PyObject *module)
     // interrupt) so that attempts to unlink the handle after our module state
     // is destroyed do not crash.
     clear_shutdown_handles(state);
+    threading_atexits_clear(state);
     return 0;
 }
 

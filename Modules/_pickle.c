@@ -11,6 +11,7 @@
 #include "Python.h"
 #include "pycore_bytesobject.h"   // _PyBytesWriter
 #include "pycore_ceval.h"         // _Py_EnterRecursiveCall()
+#include "pycore_context.h"       // _PyContext_IncrementDeserializationTaint()
 #include "pycore_critical_section.h" // Py_BEGIN_CRITICAL_SECTION()
 #include "pycore_long.h"          // _PyLong_AsByteArray()
 #include "pycore_moduleobject.h"  // _PyModule_GetState()
@@ -200,7 +201,7 @@ typedef struct {
     /* functools.partial, used for implementing __newobj_ex__ with protocols
        2 and 3 */
     PyObject *partial;
-
+    
     /* Types */
     PyTypeObject *Pickler_Type;
     PyTypeObject *Unpickler_Type;
@@ -377,6 +378,14 @@ _Pickle_InitState(PickleState *st)
     st->partial = PyImport_ImportModuleAttrString("functools", "partial");
     if (!st->partial)
         goto error;
+    
+    /* Initialize cached trusted built-in functions for security checks */
+    PyObject *builtins_module = PyImport_ImportModule("builtins");
+    if (builtins_module == NULL) {
+        goto error;
+    }
+    
+    Py_DECREF(builtins_module);
 
     return 0;
 
@@ -688,6 +697,8 @@ typedef struct UnpicklerObject {
     int proto;                  /* Protocol of the pickle loaded. */
     int fix_imports;            /* Indicate whether Unpickler should fix
                                    the name of globals pickled by Python 2.x. */
+    int safe;                   /* If 1, increment taint counter (enable guard).
+                                   If 0, don't increment (but don't clear existing taint). */
 } UnpicklerObject;
 
 typedef struct {
@@ -1617,6 +1628,7 @@ _Unpickler_New(PyObject *module)
     self->memo = memo;
     self->memo_size = MEMO_SIZE;
     self->memo_len = 0;
+    self->safe = 1;
     self->persistent_load = NULL;
     self->persistent_load_attr = NULL;
     memset(&self->buffer, 0, sizeof(Py_buffer));
@@ -6701,12 +6713,15 @@ load_build(PickleState *st, UnpicklerObject *self)
     }
     if (setstate != NULL) {
         PyObject *result;
+        unsigned int saved_taint = _PyContext_SaveAndClearTaint();
 
         /* The explicit __setstate__ is responsible for everything. */
         result = _Pickle_FastCall(setstate, state);
         Py_DECREF(setstate);
-        if (result == NULL)
+        _PyContext_RestoreTaint(saved_taint);
+        if (result == NULL) {
             return -1;
+        }
         Py_DECREF(result);
         return 0;
     }
@@ -6725,6 +6740,8 @@ load_build(PickleState *st, UnpicklerObject *self)
     }
     else
         slotstate = NULL;
+
+    unsigned int saved_taint = _PyContext_SaveAndClearTaint();
 
     /* Set inst.__dict__ from the state dict (if any). */
     if (state != Py_None) {
@@ -6783,6 +6800,9 @@ load_build(PickleState *st, UnpicklerObject *self)
 
     Py_DECREF(state);
     Py_XDECREF(slotstate);
+    
+    _PyContext_RestoreTaint(saved_taint);
+    
     return status;
 }
 
@@ -6890,6 +6910,14 @@ load(PickleState *st, UnpicklerObject *self)
     PyObject *value = NULL;
     PyObject *tmp;
     char *s = NULL;
+
+    int taint_incremented = 0;
+    if (self->safe) {
+        if (_PyContext_IncrementDeserializationTaint() < 0) {
+            return NULL;
+        }
+        taint_incremented = 1;
+    }
 
     self->num_marks = 0;
     self->stack->mark_set = 0;
@@ -7019,10 +7047,21 @@ load(PickleState *st, UnpicklerObject *self)
 
     Py_CLEAR(self->persistent_load);
     PDATA_POP(st, self->stack, value);
+
+    if (taint_incremented) {
+        if (_PyContext_DecrementDeserializationTaint() < 0) {
+            Py_DECREF(value);
+            return NULL;
+        }
+    }
+
     return value;
 
 error:
     Py_CLEAR(self->persistent_load);
+    if (taint_incremented) {
+        _PyContext_DecrementDeserializationTaint();
+    }
     return NULL;
 }
 
@@ -7179,7 +7218,10 @@ _pickle_Unpickler_find_class_impl(UnpicklerObject *self, PyTypeObject *cls,
      * we don't use PyImport_GetModule here, because it can return partially-
      * initialised modules, which then cause the getattribute to fail.
      */
+    unsigned int saved_taint = _PyContext_SaveAndClearTaint();
     module = PyImport_Import(module_name);
+    _PyContext_RestoreTaint(saved_taint);
+
     if (module == NULL) {
         return NULL;
     }
@@ -7313,6 +7355,7 @@ _pickle.Unpickler.__init__
   encoding: str = 'ASCII'
   errors: str = 'strict'
   buffers: object(c_default="NULL") = ()
+  safe: bool = True
 
 This takes a binary file for reading a pickle data stream.
 
@@ -7339,8 +7382,9 @@ string instances as bytes objects.
 static int
 _pickle_Unpickler___init___impl(UnpicklerObject *self, PyObject *file,
                                 int fix_imports, const char *encoding,
-                                const char *errors, PyObject *buffers)
-/*[clinic end generated code: output=09f0192649ea3f85 input=ca4c1faea9553121]*/
+                                const char *errors, PyObject *buffers,
+                                int safe)
+/*[clinic end generated code: output=9d4558f1e1cca7ad input=5845c47ecda24820]*/
 {
     /* In case of multiple __init__() calls, clear previous content. */
     if (self->read != NULL)
@@ -7356,6 +7400,7 @@ _pickle_Unpickler___init___impl(UnpicklerObject *self, PyObject *file,
         return -1;
 
     self->fix_imports = fix_imports;
+    self->safe = safe;
 
     PyTypeObject *tp = Py_TYPE(self);
     PickleState *state = _Pickle_FindStateByType(tp);
@@ -7833,6 +7878,7 @@ _pickle.load
   encoding: str = 'ASCII'
   errors: str = 'strict'
   buffers: object(c_default="NULL") = ()
+  safe: bool = True
 
 Read and return an object from the pickle data stored in a file.
 
@@ -7862,8 +7908,8 @@ string instances as bytes objects.
 static PyObject *
 _pickle_load_impl(PyObject *module, PyObject *file, int fix_imports,
                   const char *encoding, const char *errors,
-                  PyObject *buffers)
-/*[clinic end generated code: output=250452d141c23e76 input=46c7c31c92f4f371]*/
+                  PyObject *buffers, int safe)
+/*[clinic end generated code: output=a0fe52cb999d1aaf input=fd95c1f0ef933e24]*/
 {
     PyObject *result;
     UnpicklerObject *unpickler = _Unpickler_New(module);
@@ -7881,6 +7927,7 @@ _pickle_load_impl(PyObject *module, PyObject *file, int fix_imports,
         goto error;
 
     unpickler->fix_imports = fix_imports;
+    unpickler->safe = safe;
 
     PickleState *state = _Pickle_GetState(module);
     result = load(state, unpickler);
@@ -7903,6 +7950,7 @@ _pickle.loads
   encoding: str = 'ASCII'
   errors: str = 'strict'
   buffers: object(c_default="NULL") = ()
+  safe: bool = True
 
 Read and return an object from the given pickle data.
 
@@ -7923,8 +7971,8 @@ string instances as bytes objects.
 static PyObject *
 _pickle_loads_impl(PyObject *module, PyObject *data, int fix_imports,
                    const char *encoding, const char *errors,
-                   PyObject *buffers)
-/*[clinic end generated code: output=82ac1e6b588e6d02 input=b3615540d0535087]*/
+                   PyObject *buffers, int safe)
+/*[clinic end generated code: output=1d5a51ea1e63025d input=69395cadca9c3878]*/
 {
     PyObject *result;
     UnpicklerObject *unpickler = _Unpickler_New(module);
@@ -7942,6 +7990,7 @@ _pickle_loads_impl(PyObject *module, PyObject *data, int fix_imports,
         goto error;
 
     unpickler->fix_imports = fix_imports;
+    unpickler->safe = safe;
 
     PickleState *state = _Pickle_GetState(module);
     result = load(state, unpickler);

@@ -214,6 +214,9 @@ def test_open(testfn):
             (open, sys.executable, "rb"),
             (open, 3, "wb"),
             (open, testfn, "w", -1, None, None, None, False, lambda *a: 1),
+            (os.open, testfn, os.O_RDONLY) if hasattr(os, 'O_RDONLY') else None,
+            (os.open, testfn, os.O_WRONLY | os.O_CREAT) if hasattr(os, 'O_WRONLY') else None,
+            (os.open, testfn, os.O_RDWR | os.O_CREAT) if hasattr(os, 'O_RDWR') else None,
             (load_dh_params, testfn),
             (rl("read_history_file"), testfn),
             (rl("read_history_file"), None),
@@ -237,8 +240,8 @@ def test_open(testfn):
                     else:
                         raise
 
-    actual_mode = [(a[0], a[1]) for e, a in hook.seen if e == "open" and a[1]]
-    actual_flag = [(a[0], a[2]) for e, a in hook.seen if e == "open" and not a[1]]
+    actual_mode = [(a[0], a[1]) for e, a in hook.seen if e == "open" and a[1] and isinstance(a[1], str)]
+    actual_flag = [(a[0], a[2]) for e, a in hook.seen if e == "open" and len(a) > 2 and a[1] is None and isinstance(a[2], int)]
     assertSequenceEqual(
         [
             i
@@ -261,7 +264,16 @@ def test_open(testfn):
         ],
         actual_mode,
     )
-    assertSequenceEqual([], actual_flag)
+    if hasattr(os, 'O_RDONLY'):
+        cloexec = getattr(os, 'O_CLOEXEC', 0)
+        expected_flags = [
+            (testfn, os.O_RDONLY | cloexec),
+            (testfn, (os.O_WRONLY | os.O_CREAT | cloexec)) if hasattr(os, 'O_WRONLY') else None,
+            (testfn, (os.O_RDWR | os.O_CREAT | cloexec)) if hasattr(os, 'O_RDWR') else None,
+        ]
+        assertSequenceEqual([i for i in expected_flags if i is not None], actual_flag)
+    else:
+        assertSequenceEqual([], actual_flag)
 
 
 def test_cantrace():
@@ -671,6 +683,88 @@ def test_sys_remote_exec():
         assertEqual(event_pid, pid)
         assertEqual(event_script_path, tmp_file.name)
         assertEqual(remote_event_script_path, tmp_file.name)
+
+
+def test_builtins_setattr():
+    class TestClass:
+        pass
+
+    obj = TestClass()
+
+    with TestHook() as hook:
+        setattr(obj, "test_attr", "test_value")
+        setattr(obj, "another_attr", 42)
+
+    actual = [(a[0].__class__.__name__, a[1], a[2])
+              for e, a in hook.seen if e == "builtins.setattr"]
+    assertSequenceEqual(
+        [("TestClass", "test_attr", "test_value"),
+         ("TestClass", "another_attr", 42)],
+        actual
+    )
+
+
+def test_atexit_register():
+    import atexit
+
+    def cleanup():
+        pass
+
+    def another_cleanup(*args, **kwargs):
+        pass
+
+    with TestHook() as hook:
+        atexit.register(cleanup)
+        atexit.register(another_cleanup, "arg1", kwarg="value")
+
+    actual = [a[0].__name__ for e, a in hook.seen if e == "atexit.register"]
+    assertSequenceEqual(["cleanup", "another_cleanup"], actual)
+
+
+def test_threading_register_atexit():
+    import threading
+
+    def cleanup():
+        pass
+
+    def another_cleanup(*args, **kwargs):
+        pass
+
+    with TestHook() as hook:
+        threading._register_atexit(cleanup)
+        threading._register_atexit(another_cleanup, "arg1", kwarg="value")
+
+    actual = [(e, a) for e, a in hook.seen if e == "threading._register_atexit"]
+    assertEqual(len(actual), 2)
+    assertEqual(actual[0][0], "threading._register_atexit")
+    assertEqual(actual[1][0], "threading._register_atexit")
+    assertEqual(len(actual[0][1]), 1)
+    assertEqual(len(actual[1][1]), 1)
+    assert callable(actual[0][1][0])
+    assert callable(actual[1][1][0])
+
+
+def test_signal_signal():
+    import signal
+
+    def handler(signum, frame):
+        pass
+
+    with TestHook() as hook:
+        old_handler = signal.signal(signal.SIGTERM, handler)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, old_handler)
+
+    actual = [(a[0], a[1].__name__ if callable(a[1]) else str(a[1]))
+              for e, a in hook.seen if e == "signal.signal"]
+
+    assertSequenceEqual(
+        [(signal.SIGTERM, "handler"),
+         (signal.SIGTERM, str(signal.SIG_DFL)),
+         (signal.SIGTERM, old_handler.__name__ if callable(old_handler) else str(old_handler))],
+        actual
+    )
+
 
 if __name__ == "__main__":
     from test.support import suppress_msvcrt_asserts
