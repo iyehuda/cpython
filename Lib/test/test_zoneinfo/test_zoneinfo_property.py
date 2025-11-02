@@ -134,6 +134,7 @@ class CZoneInfoTest(ZoneInfoTest):
 
 class ZoneInfoPickleTest(ZoneInfoTestBase):
     module = py_zoneinfo
+    safe_pickle = False
 
     def setUp(self):
         with contextlib.ExitStack() as stack:
@@ -148,7 +149,7 @@ class ZoneInfoPickleTest(ZoneInfoTestBase):
         zi = self.klass(key)
         for proto in range(pickle.HIGHEST_PROTOCOL + 1):
             pkl_str = pickle.dumps(zi, proto)
-            zi_rt = pickle.loads(pkl_str)
+            zi_rt = pickle.loads(pkl_str, safe=self.safe_pickle)
 
             self.assertIs(zi, zi_rt)
 
@@ -158,7 +159,7 @@ class ZoneInfoPickleTest(ZoneInfoTestBase):
         zi = self.klass.no_cache(key)
         for proto in range(pickle.HIGHEST_PROTOCOL + 1):
             pkl_str = pickle.dumps(zi, proto)
-            zi_rt = pickle.loads(pkl_str)
+            zi_rt = pickle.loads(pkl_str, safe=self.safe_pickle)
 
             self.assertIsNot(zi, zi_rt)
             self.assertEqual(str(zi), str(zi_rt))
@@ -169,9 +170,9 @@ class ZoneInfoPickleTest(ZoneInfoTestBase):
         """Test that pickle/unpickle is idempotent."""
         zi_0 = self.klass(key)
         pkl_str_0 = pickle.dumps(zi_0)
-        zi_1 = pickle.loads(pkl_str_0)
+        zi_1 = pickle.loads(pkl_str_0, safe=self.safe_pickle)
         pkl_str_1 = pickle.dumps(zi_1)
-        zi_2 = pickle.loads(pkl_str_1)
+        zi_2 = pickle.loads(pkl_str_1, safe=self.safe_pickle)
         pkl_str_2 = pickle.dumps(zi_2)
 
         self.assertEqual(pkl_str_0, pkl_str_1)
@@ -189,9 +190,9 @@ class ZoneInfoPickleTest(ZoneInfoTestBase):
 
         zi_0 = self.klass.no_cache(key)
         pkl_str_0 = pickle.dumps(zi_0)
-        zi_1 = pickle.loads(pkl_str_0)
+        zi_1 = pickle.loads(pkl_str_0, safe=self.safe_pickle)
         pkl_str_1 = pickle.dumps(zi_1)
-        zi_2 = pickle.loads(pkl_str_1)
+        zi_2 = pickle.loads(pkl_str_1, safe=self.safe_pickle)
         pkl_str_2 = pickle.dumps(zi_2)
 
         self.assertEqual(pkl_str_0, pkl_str_1)
@@ -208,6 +209,7 @@ class ZoneInfoPickleTest(ZoneInfoTestBase):
 
 class CZoneInfoPickleTest(ZoneInfoPickleTest):
     module = c_zoneinfo
+    safe_pickle = True
 
 
 class ZoneInfoCacheTest(ZoneInfoTestBase):
@@ -360,11 +362,11 @@ class PythonCConsistencyTest(unittest.TestCase):
             c_pkl = pickle.dumps(c_zi)
 
         with test_support.set_zoneinfo_module(c_zoneinfo):
-            # Python → C
-            py_to_c_zi = pickle.loads(py_pkl)
+            # Python → C (C implementation uses safe=True)
+            py_to_c_zi = pickle.loads(py_pkl, safe=True)
             self.assertIs(py_to_c_zi, c_zi)
 
         with test_support.set_zoneinfo_module(py_zoneinfo):
-            # C → Python
-            c_to_py_zi = pickle.loads(c_pkl)
+            # C → Python (Python implementation uses safe=False)
+            c_to_py_zi = pickle.loads(c_pkl, safe=False)
             self.assertIs(c_to_py_zi, py_zi)

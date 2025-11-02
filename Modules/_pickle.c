@@ -202,17 +202,6 @@ typedef struct {
        2 and 3 */
     PyObject *partial;
     
-    /* Cached trusted built-in functions for security checks */
-    PyObject *builtin_iter;
-    PyObject *builtin_bytes;
-    PyObject *builtin_bytearray;
-    PyObject *builtin_str;
-    PyObject *builtin_list;
-    PyObject *builtin_tuple;
-    PyObject *builtin_dict;
-    PyObject *builtin_set;
-    PyObject *builtin_frozenset;
-
     /* Types */
     PyTypeObject *Pickler_Type;
     PyTypeObject *Unpickler_Type;
@@ -267,32 +256,12 @@ _Pickle_ClearState(PickleState *st)
     Py_CLEAR(st->codecs_encode);
     Py_CLEAR(st->getattr);
     Py_CLEAR(st->partial);
-    Py_CLEAR(st->builtin_iter);
-    Py_CLEAR(st->builtin_bytes);
-    Py_CLEAR(st->builtin_bytearray);
-    Py_CLEAR(st->builtin_str);
-    Py_CLEAR(st->builtin_list);
-    Py_CLEAR(st->builtin_tuple);
-    Py_CLEAR(st->builtin_dict);
-    Py_CLEAR(st->builtin_set);
-    Py_CLEAR(st->builtin_frozenset);
     Py_CLEAR(st->Pickler_Type);
     Py_CLEAR(st->Unpickler_Type);
     Py_CLEAR(st->Pdata_Type);
     Py_CLEAR(st->PicklerMemoProxyType);
     Py_CLEAR(st->UnpicklerMemoProxyType);
 }
-
-static const char* TRUSTED_MODULES[] = {
-    "multiprocessing",
-    "socket",
-    "_socket",
-    "test",
-    "copyreg",
-    "functools",
-    "zoneinfo",
-    NULL
-};
 
 /* Initialize the given pickle module state. */
 static int
@@ -416,27 +385,7 @@ _Pickle_InitState(PickleState *st)
         goto error;
     }
     
-    st->builtin_iter = PyObject_GetAttrString(builtins_module, "iter");
-    st->builtin_bytes = PyObject_GetAttrString(builtins_module, "bytes");
-    st->builtin_bytearray = PyObject_GetAttrString(builtins_module, "bytearray");
-    st->builtin_str = PyObject_GetAttrString(builtins_module, "str");
-    st->builtin_list = PyObject_GetAttrString(builtins_module, "list");
-    st->builtin_tuple = PyObject_GetAttrString(builtins_module, "tuple");
-    st->builtin_dict = PyObject_GetAttrString(builtins_module, "dict");
-    st->builtin_set = PyObject_GetAttrString(builtins_module, "set");
-    st->builtin_frozenset = PyObject_GetAttrString(builtins_module, "frozenset");
-    
     Py_DECREF(builtins_module);
-    
-    /* Check that we got all the built-ins */
-    if (st->builtin_iter == NULL || st->builtin_bytes == NULL ||
-        st->builtin_bytearray == NULL || st->builtin_str == NULL ||
-        st->builtin_list == NULL || st->builtin_tuple == NULL ||
-        st->builtin_dict == NULL || st->builtin_set == NULL ||
-        st->builtin_frozenset == NULL)
-    {
-        goto error;
-    }
 
     return 0;
 
@@ -748,6 +697,8 @@ typedef struct UnpicklerObject {
     int proto;                  /* Protocol of the pickle loaded. */
     int fix_imports;            /* Indicate whether Unpickler should fix
                                    the name of globals pickled by Python 2.x. */
+    int safe;                   /* If 1, increment taint counter (enable guard).
+                                   If 0, don't increment (but don't clear existing taint). */
 } UnpicklerObject;
 
 typedef struct {
@@ -1677,6 +1628,7 @@ _Unpickler_New(PyObject *module)
     self->memo = memo;
     self->memo_size = MEMO_SIZE;
     self->memo_len = 0;
+    self->safe = 1;
     self->persistent_load = NULL;
     self->persistent_load_attr = NULL;
     memset(&self->buffer, 0, sizeof(Py_buffer));
@@ -5246,281 +5198,6 @@ static PyType_Spec pickler_type_spec = {
     .slots = pickler_type_slots,
 };
 
-static PyTypeObject *
-_get_functools_partial_type(void)
-{
-    static PyTypeObject *functools_partial_type = NULL;
-    if (functools_partial_type == NULL) {
-        PyObject *functools_module = PyImport_ImportModule("functools");
-        if (functools_module != NULL) {
-            PyObject *partial_obj = PyObject_GetAttrString(functools_module, "partial");
-            if (partial_obj != NULL && PyType_Check(partial_obj)) {
-                functools_partial_type = (PyTypeObject *)partial_obj;
-            }
-            else {
-                Py_XDECREF(partial_obj);
-            }
-            Py_DECREF(functools_module);
-        }
-    }
-    return functools_partial_type;
-}
-
-/* Check if an object is a genuine functools.partial instance.
-   Only exact type matches are accepted */
-static int
-_is_functools_partial(PyObject *obj)
-{
-    PyTypeObject *functools_partial_type = _get_functools_partial_type();
-    if (functools_partial_type == NULL) {
-        return 0;
-    }
-
-    return Py_TYPE(obj) == functools_partial_type;
-}
-
-/* Extract and validate the __module__ attribute from a callable. */
-static PyObject *
-_get_module_name(PyObject *callable)
-{
-    PyObject *module_name = PyObject_GetAttrString(callable, "__module__");
-    if (module_name == NULL || !PyUnicode_Check(module_name)) {
-        PyErr_Clear();
-        Py_XDECREF(module_name);
-        return NULL;
-    }
-    return module_name;
-}
-
-/* Check if a module name is in the trusted modules list. */
-static int
-_is_trusted_module(const char *module_str)
-{
-    const char **trusted_module;
-    for (trusted_module = TRUSTED_MODULES; *trusted_module != NULL; trusted_module++) {
-        if (strcmp(module_str, *trusted_module) == 0) {
-            return 1;
-        }
-        if (strcmp(*trusted_module, "multiprocessing") == 0 &&
-            strncmp(module_str, "multiprocessing.", 16) == 0) {
-            return 1;
-        }
-        if (strcmp(*trusted_module, "test") == 0 &&
-            strncmp(module_str, "test.", 5) == 0) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-/* Get __qualname__ or fall back to __name__ from a callable. */
-static PyObject *
-_get_callable_qualname(PyObject *callable)
-{
-    PyObject *qualname_obj = PyObject_GetAttrString(callable, "__qualname__");
-    if (qualname_obj != NULL && PyUnicode_Check(qualname_obj)) {
-        return qualname_obj;
-    }
-
-    PyErr_Clear();
-    Py_XDECREF(qualname_obj);
-
-    PyObject *name_obj = PyObject_GetAttrString(callable, "__name__");
-    if (name_obj != NULL && PyUnicode_Check(name_obj)) {
-        return name_obj;
-    }
-
-    PyErr_Clear();
-    Py_XDECREF(name_obj);
-    return NULL;
-}
-
-/* Verify that callable is the genuine object from the specified module. */
-static int
-_verify_object_identity(PyObject *callable, PyObject *module_name, PyObject *qualname_obj)
-{
-    PyObject *module = PyImport_GetModule(module_name);
-    if (module == NULL) {
-        PyErr_Clear();
-        unsigned int saved_taint = _PyContext_SaveAndClearTaint();
-        module = PyImport_Import(module_name);
-        _PyContext_RestoreTaint(saved_taint);
-        if (module == NULL) {
-            PyErr_Clear();
-            return 0;
-        }
-    }
-
-    PyObject *dotted_path = get_dotted_path(qualname_obj);
-    if (dotted_path == NULL) {
-        PyErr_Clear();
-        Py_DECREF(module);
-        return 0;
-    }
-
-    PyObject *actual_obj = getattribute(module, dotted_path, 0);
-    Py_DECREF(module);
-    Py_DECREF(dotted_path);
-
-    if (actual_obj == NULL) {
-        PyErr_Clear();
-        return 0;
-    }
-
-    /* For bound methods, compare the underlying function/self pair */
-    PyObject *callable_func = callable;
-    PyObject *actual_func = actual_obj;
-    PyObject *callable_self = NULL;
-    PyObject *actual_self = NULL;
-    
-    if (PyMethod_Check(callable)) {
-        callable_func = PyMethod_GET_FUNCTION(callable);
-        callable_self = PyMethod_GET_SELF(callable);
-    }
-    else if (PyCFunction_Check(callable)) {
-        callable_self = PyCFunction_GET_SELF(callable);
-    }
-    
-    if (PyMethod_Check(actual_obj)) {
-        actual_func = PyMethod_GET_FUNCTION(actual_obj);
-        actual_self = PyMethod_GET_SELF(actual_obj);
-    }
-    else if (PyCFunction_Check(actual_obj)) {
-        actual_self = PyCFunction_GET_SELF(actual_obj);
-    }
-    
-    /* Check if underlying functions match */
-    int is_same = (callable_func == actual_func);
-    
-    /* For PyCFunction bound methods, compare the C function pointer and __self__ */
-    if (!is_same && PyCFunction_Check(callable) && PyCFunction_Check(actual_obj)) {
-        /* Compare the actual C function pointers */
-        PyCFunction callable_cfunc = PyCFunction_GET_FUNCTION(callable);
-        PyCFunction actual_cfunc = PyCFunction_GET_FUNCTION(actual_obj);
-        
-        if (callable_cfunc == actual_cfunc && callable_self == actual_self) {
-            is_same = 1;
-        }
-    }
-    
-    Py_DECREF(actual_obj);
-    return is_same;
-}
-
-/* Check if a callable is a trusted built-in function using pointer equality. */
-static int
-_is_trusted_builtin(PickleState *st, PyObject *callable)
-{
-    if (callable == NULL) {
-        return 0;
-    }
-    
-    /* Check against cached trusted built-in functions using pointer equality */
-    if (callable == st->codecs_encode ||
-        callable == st->getattr ||
-        callable == st->builtin_iter ||
-        callable == st->builtin_bytes ||
-        callable == st->builtin_bytearray ||
-        callable == st->builtin_str ||
-        callable == st->builtin_list ||
-        callable == st->builtin_tuple ||
-        callable == st->builtin_dict ||
-        callable == st->builtin_set ||
-        callable == st->builtin_frozenset)
-    {
-        return 1;
-    }
-    
-    return 0;
-}
-
-/* Check if a reducer is from a trusted module by verifying object identity. */
-static int
-_is_trusted_reducer(PickleState *st, PyObject *callable)
-{
-    /* First check if it's a trusted built-in function */
-    if (_is_trusted_builtin(st, callable)) {
-        return 1;
-    }
-
-    if (_is_functools_partial(callable)) {
-        PyObject *func = PyObject_GetAttrString(callable, "func");
-        if (func != NULL) {
-            int result = _is_trusted_reducer(st, func);
-            Py_DECREF(func);
-            return result;
-        }
-        PyErr_Clear();
-        return 0;
-    }
-
-    /* Check if it's a bound method using type checks */
-    PyObject *self_obj = NULL;
-    if (PyMethod_Check(callable)) {
-        self_obj = PyMethod_GET_SELF(callable);
-    }
-    else if (PyCFunction_Check(callable)) {
-        self_obj = PyCFunction_GET_SELF(callable);
-    }
-    
-    if (self_obj != NULL && PyType_Check(self_obj)) {
-        PyObject *cls_module = PyObject_GetAttrString(self_obj, "__module__");
-        
-        if (cls_module != NULL && PyUnicode_Check(cls_module)) {
-            const char *cls_module_str = PyUnicode_AsUTF8(cls_module);
-            int is_trusted_module_name = (cls_module_str != NULL && 
-                                         _is_trusted_module(cls_module_str));
-            
-            if (is_trusted_module_name) {
-                /* Verify object identity to ensure it's genuine from the trusted module */
-                PyObject *qualname_obj = _get_callable_qualname(callable);
-                if (qualname_obj != NULL) {
-                    int is_trusted = _verify_object_identity(callable, cls_module, qualname_obj);
-                    Py_DECREF(qualname_obj);
-                    if (is_trusted) {
-                        Py_DECREF(cls_module);
-                        return 1;
-                    }
-                }
-            }
-            Py_DECREF(cls_module);
-        }
-        else {
-            Py_XDECREF(cls_module);
-        }
-        PyErr_Clear();
-    }
-
-    PyObject *module_name = _get_module_name(callable);
-    if (module_name == NULL) {
-        return 0;
-    }
-
-    const char *module_str = PyUnicode_AsUTF8(module_name);
-    if (module_str == NULL) {
-        PyErr_Clear();
-        Py_DECREF(module_name);
-        return 0;
-    }
-
-    if (!_is_trusted_module(module_str)) {
-        Py_DECREF(module_name);
-        return 0;
-    }
-
-    PyObject *qualname_obj = _get_callable_qualname(callable);
-    if (qualname_obj == NULL) {
-        Py_DECREF(module_name);
-        return 0;
-    }
-
-    int is_trusted = _verify_object_identity(callable, module_name, qualname_obj);
-
-    Py_DECREF(module_name);
-    Py_DECREF(qualname_obj);
-    return is_trusted;
-}
-
 /* Temporary helper for calling self.find_class().
 
    XXX: It would be nice to able to avoid Python function call overhead, by
@@ -7168,19 +6845,7 @@ load_reduce(PickleState *state, UnpicklerObject *self)
         return -1;
     PDATA_POP(state, self->stack, callable);
     if (callable) {
-        int is_trusted = _is_trusted_reducer(state, callable);
-        unsigned int saved_taint = 0;
-
-        if (is_trusted) {
-            saved_taint = _PyContext_SaveAndClearTaint();
-        }
-
         obj = PyObject_CallObject(callable, argtup);
-
-        if (is_trusted) {
-            _PyContext_RestoreTaint(saved_taint);
-        }
-
         Py_DECREF(callable);
     }
     Py_DECREF(argtup);
@@ -7246,8 +6911,12 @@ load(PickleState *st, UnpicklerObject *self)
     PyObject *tmp;
     char *s = NULL;
 
-    if (_PyContext_IncrementDeserializationTaint() < 0) {
-        return NULL;
+    int taint_incremented = 0;
+    if (self->safe) {
+        if (_PyContext_IncrementDeserializationTaint() < 0) {
+            return NULL;
+        }
+        taint_incremented = 1;
     }
 
     self->num_marks = 0;
@@ -7379,16 +7048,20 @@ load(PickleState *st, UnpicklerObject *self)
     Py_CLEAR(self->persistent_load);
     PDATA_POP(st, self->stack, value);
 
-    if (_PyContext_DecrementDeserializationTaint() < 0) {
-        Py_DECREF(value);
-        return NULL;
+    if (taint_incremented) {
+        if (_PyContext_DecrementDeserializationTaint() < 0) {
+            Py_DECREF(value);
+            return NULL;
+        }
     }
 
     return value;
 
 error:
     Py_CLEAR(self->persistent_load);
-    _PyContext_DecrementDeserializationTaint();
+    if (taint_incremented) {
+        _PyContext_DecrementDeserializationTaint();
+    }
     return NULL;
 }
 
@@ -7682,6 +7355,7 @@ _pickle.Unpickler.__init__
   encoding: str = 'ASCII'
   errors: str = 'strict'
   buffers: object(c_default="NULL") = ()
+  safe: bool = True
 
 This takes a binary file for reading a pickle data stream.
 
@@ -7708,8 +7382,9 @@ string instances as bytes objects.
 static int
 _pickle_Unpickler___init___impl(UnpicklerObject *self, PyObject *file,
                                 int fix_imports, const char *encoding,
-                                const char *errors, PyObject *buffers)
-/*[clinic end generated code: output=09f0192649ea3f85 input=ca4c1faea9553121]*/
+                                const char *errors, PyObject *buffers,
+                                int safe)
+/*[clinic end generated code: output=9d4558f1e1cca7ad input=5845c47ecda24820]*/
 {
     /* In case of multiple __init__() calls, clear previous content. */
     if (self->read != NULL)
@@ -7725,6 +7400,7 @@ _pickle_Unpickler___init___impl(UnpicklerObject *self, PyObject *file,
         return -1;
 
     self->fix_imports = fix_imports;
+    self->safe = safe;
 
     PyTypeObject *tp = Py_TYPE(self);
     PickleState *state = _Pickle_FindStateByType(tp);
@@ -8202,6 +7878,7 @@ _pickle.load
   encoding: str = 'ASCII'
   errors: str = 'strict'
   buffers: object(c_default="NULL") = ()
+  safe: bool = True
 
 Read and return an object from the pickle data stored in a file.
 
@@ -8231,8 +7908,8 @@ string instances as bytes objects.
 static PyObject *
 _pickle_load_impl(PyObject *module, PyObject *file, int fix_imports,
                   const char *encoding, const char *errors,
-                  PyObject *buffers)
-/*[clinic end generated code: output=250452d141c23e76 input=46c7c31c92f4f371]*/
+                  PyObject *buffers, int safe)
+/*[clinic end generated code: output=a0fe52cb999d1aaf input=fd95c1f0ef933e24]*/
 {
     PyObject *result;
     UnpicklerObject *unpickler = _Unpickler_New(module);
@@ -8250,6 +7927,7 @@ _pickle_load_impl(PyObject *module, PyObject *file, int fix_imports,
         goto error;
 
     unpickler->fix_imports = fix_imports;
+    unpickler->safe = safe;
 
     PickleState *state = _Pickle_GetState(module);
     result = load(state, unpickler);
@@ -8272,6 +7950,7 @@ _pickle.loads
   encoding: str = 'ASCII'
   errors: str = 'strict'
   buffers: object(c_default="NULL") = ()
+  safe: bool = True
 
 Read and return an object from the given pickle data.
 
@@ -8292,8 +7971,8 @@ string instances as bytes objects.
 static PyObject *
 _pickle_loads_impl(PyObject *module, PyObject *data, int fix_imports,
                    const char *encoding, const char *errors,
-                   PyObject *buffers)
-/*[clinic end generated code: output=82ac1e6b588e6d02 input=b3615540d0535087]*/
+                   PyObject *buffers, int safe)
+/*[clinic end generated code: output=1d5a51ea1e63025d input=69395cadca9c3878]*/
 {
     PyObject *result;
     UnpicklerObject *unpickler = _Unpickler_New(module);
@@ -8311,6 +7990,7 @@ _pickle_loads_impl(PyObject *module, PyObject *data, int fix_imports,
         goto error;
 
     unpickler->fix_imports = fix_imports;
+    unpickler->safe = safe;
 
     PickleState *state = _Pickle_GetState(module);
     result = load(state, unpickler);
@@ -8361,15 +8041,6 @@ pickle_traverse(PyObject *m, visitproc visit, void *arg)
     Py_VISIT(st->codecs_encode);
     Py_VISIT(st->getattr);
     Py_VISIT(st->partial);
-    Py_VISIT(st->builtin_iter);
-    Py_VISIT(st->builtin_bytes);
-    Py_VISIT(st->builtin_bytearray);
-    Py_VISIT(st->builtin_str);
-    Py_VISIT(st->builtin_list);
-    Py_VISIT(st->builtin_tuple);
-    Py_VISIT(st->builtin_dict);
-    Py_VISIT(st->builtin_set);
-    Py_VISIT(st->builtin_frozenset);
     Py_VISIT(st->Pickler_Type);
     Py_VISIT(st->Unpickler_Type);
     Py_VISIT(st->Pdata_Type);

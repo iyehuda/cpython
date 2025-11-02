@@ -127,9 +127,9 @@ def _main(fd, parent_sentinel):
     with os.fdopen(fd, 'rb', closefd=True) as from_parent:
         process.current_process()._inheriting = True
         try:
-            preparation_data = reduction.pickle.load(from_parent)
+            preparation_data = reduction.pickle.load(from_parent, safe=False)
             prepare(preparation_data)
-            self = reduction.pickle.load(from_parent)
+            self = reduction.pickle.load(from_parent, safe=False)
         finally:
             del process.current_process()._inheriting
     return self._bootstrap(parent_sentinel)

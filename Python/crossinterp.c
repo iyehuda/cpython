@@ -641,7 +641,21 @@ _PyPickle_Loads(struct _unpickle_context *ctx, PyObject *pickled)
     }
 
     // Make an initial attempt to unpickle.
-    PyObject *obj = PyObject_CallOneArg(loads, pickled);
+    PyObject *args = PyTuple_Pack(1, pickled);
+    if (args == NULL) {
+        Py_DECREF(loads);
+        return NULL;
+    }
+    PyObject *kwargs = PyDict_New();
+    if (kwargs == NULL) {
+        Py_DECREF(args);
+        Py_DECREF(loads);
+        return NULL;
+    }
+    PyDict_SetItemString(kwargs, "safe", Py_False);
+    PyObject *obj = PyObject_Call(loads, args, kwargs);
+    Py_DECREF(args);
+    Py_DECREF(kwargs);
     if (obj != NULL) {
         goto finally;
     }
@@ -665,7 +679,21 @@ _PyPickle_Loads(struct _unpickle_context *ctx, PyObject *pickled)
     }
 
     // Try to unpickle once more.
-    obj = PyObject_CallOneArg(loads, pickled);
+    args = PyTuple_Pack(1, pickled);
+    if (args == NULL) {
+        restore_main(tstate, &ctx->main);
+        goto finally;
+    }
+    kwargs = PyDict_New();
+    if (kwargs == NULL) {
+        Py_DECREF(args);
+        restore_main(tstate, &ctx->main);
+        goto finally;
+    }
+    PyDict_SetItemString(kwargs, "safe", Py_False);
+    obj = PyObject_Call(loads, args, kwargs);
+    Py_DECREF(args);
+    Py_DECREF(kwargs);
     restore_main(tstate, &ctx->main);
     if (obj == NULL) {
         goto finally;

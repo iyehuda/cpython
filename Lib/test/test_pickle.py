@@ -483,7 +483,7 @@ if has_c_implementation:
                 0)  # Write buffer is cleared after every dump().
 
         def test_unpickler(self):
-            basesize = support.calcobjsize('2P2n2P 2P2n2i5P 2P3n8P2n2i')
+            basesize = support.calcobjsize('2P2n2P 2P2n2i5P 2P3n8P2n2i i')
             unpickler = _pickle.Unpickler
             P = struct.calcsize('P')  # Size of memo table entry.
             n = struct.calcsize('n')  # Size of mark table entry.
@@ -773,6 +773,14 @@ def load_tests(loader, tests, pattern):
 
 
 class DeserializationGuardTests(unittest.TestCase):
+    @staticmethod
+    def _malicious_search_function(encoding):
+        return None
+
+    @staticmethod
+    def _malicious_error_handler(exc):
+        return ('', 0)
+
     @support.cpython_only
     def test_os_system_blocked_during_pickle(self):
         import os
@@ -922,6 +930,68 @@ class DeserializationGuardTests(unittest.TestCase):
 
         data = pickle.dumps(MaliciousCompile())
         with self.assertRaisesRegex(RuntimeError, 'compile is disabled'):
+            pickle.loads(data)
+
+    @support.cpython_only
+    def test_multiprocessing_bypass_blocked(self):
+        import os
+        import multiprocessing
+
+        class PickledProcess:
+            def __init__(self):
+                pass
+
+            def __reduce__(self):
+                ctx = multiprocessing.get_context('fork')
+                return ctx.Process, (None, os.system, 'p', ('echo test',))
+
+        class StartProcess:
+            def __init__(self):
+                self._p = PickledProcess()
+
+            def __reduce__(self):
+                return multiprocessing.Process._Popen, (self._p,)
+
+        malicious = StartProcess()
+        data = pickle.dumps(malicious)
+        with self.assertRaisesRegex(RuntimeError, 'disabled during deserialization'):
+            pickle.loads(data)
+
+    @support.cpython_only
+    def test_socket_bypass_blocked(self):
+        import socket
+
+        class MaliciousSocket:
+            def __reduce__(self):
+                return socket.socket, (socket.AF_INET, socket.SOCK_STREAM)
+
+        malicious = MaliciousSocket()
+        data = pickle.dumps(malicious)
+        with self.assertRaisesRegex(RuntimeError, 'disabled during deserialization'):
+            pickle.loads(data)
+
+    def test_codec_register_blocked_during_deserialization(self):
+        import codecs
+
+        class MaliciousCodecRegister:
+            def __reduce__(self):
+                return (codecs.register, (DeserializationGuardTests._malicious_search_function,))
+
+        malicious = MaliciousCodecRegister()
+        data = pickle.dumps(malicious)
+        with self.assertRaisesRegex(RuntimeError, 'codecs.register is disabled during deserialization'):
+            pickle.loads(data)
+
+    def test_codec_register_error_blocked_during_deserialization(self):
+        import codecs
+
+        class MaliciousErrorRegister:
+            def __reduce__(self):
+                return (codecs.register_error, ('malicious', DeserializationGuardTests._malicious_error_handler))
+
+        malicious = MaliciousErrorRegister()
+        data = pickle.dumps(malicious)
+        with self.assertRaisesRegex(RuntimeError, 'codecs.register_error is disabled during deserialization'):
             pickle.loads(data)
 
     @support.cpython_only
