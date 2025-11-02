@@ -166,6 +166,16 @@ PyAPI_FUNC(int) PyThread_detach_thread(PyThread_handle_t);
  */
 void _Py_NO_RETURN PyThread_hang_thread(void);
 
+/* Threading module atexit registration API.
+ *
+ * These functions are used by the threading module to register callbacks
+ * that are executed before threads are joined during shutdown.
+ */
+struct _object;
+typedef struct _object PyObject;
+PyAPI_FUNC(int) _PyThread_RegisterAtexit(PyObject *callable);
+PyAPI_FUNC(void) _PyThread_CallAtexits(void);
+
 #ifdef __cplusplus
 }
 #endif

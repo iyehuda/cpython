@@ -721,6 +721,29 @@ def test_atexit_register():
     assertSequenceEqual(["cleanup", "another_cleanup"], actual)
 
 
+def test_threading_register_atexit():
+    import threading
+
+    def cleanup():
+        pass
+
+    def another_cleanup(*args, **kwargs):
+        pass
+
+    with TestHook() as hook:
+        threading._register_atexit(cleanup)
+        threading._register_atexit(another_cleanup, "arg1", kwarg="value")
+
+    actual = [(e, a) for e, a in hook.seen if e == "threading._register_atexit"]
+    assertEqual(len(actual), 2)
+    assertEqual(actual[0][0], "threading._register_atexit")
+    assertEqual(actual[1][0], "threading._register_atexit")
+    assertEqual(len(actual[0][1]), 1)
+    assertEqual(len(actual[1][1]), 1)
+    assert callable(actual[0][1][0])
+    assert callable(actual[1][1][0])
+
+
 def test_signal_signal():
     import signal
 
